@@ -13,12 +13,36 @@
     Baza danych jest w s_data.lua – tutaj tylko logika.
 ]]
 
--- zabezpieczenie przed podwójnym załadowaniem (np. fxmanifest + require)
-if _G.crp_bossmenu_s_main then return {} end
-_G.crp_bossmenu_s_main = true
+--┌───────────────────────────────────────────────────────────────────────────┐
+--│  WCZYTYWANIE MODUŁÓW                                                      │
+--│  1) próbujemy `require` (Twój loader),                                     │
+--│  2) jeśli się nie uda – czytamy plik z folderu resource'a (LoadResourceFile),│
+--│  3) wynik ląduje w cache, więc każdy moduł wczyta się tylko raz.           │
+--│  Dzięki temu działa i z fxmanifestem, i z własnym loaderem.                │
+--└───────────────────────────────────────────────────────────────────────────┘
+local function loadModule(requirePath, fileName, cacheKey)
+    local cached = _G[cacheKey]
+    if type(cached) == 'table' then return cached end
 
-local Config = require('resources.bossmenu.d_bossmenu')
-local data   = require('resources.bossmenu.s_data')
+    local ok, mod = pcall(require, requirePath)
+    if not ok or type(mod) ~= 'table' then
+        local source = LoadResourceFile(GetCurrentResourceName(), fileName)
+        if not source then
+            error(('[crp_bossmenu] nie mogę wczytać %s – sprawdź, czy plik jest w folderze resource (albo w fxmanifest.lua)')
+                :format(fileName))
+        end
+        mod = ((load or loadstring)(source, '@' .. fileName))()
+    end
+
+    _G[cacheKey] = mod
+    return mod
+end
+
+-- zabezpieczenie przed podwójnym załadowaniem (np. fxmanifest + require)
+if _G.crp_bossmenu_s_main then return _G.crp_bossmenu_s_main end
+
+local Config = loadModule('resources.bossmenu.d_bossmenu', 'd_bossmenu.lua', 'crp_bossmenu_config')
+local data   = loadModule('resources.bossmenu.s_data', 's_data.lua', 'crp_bossmenu_s_data')
 local ESX    = exports['es_extended']:getSharedObject()
 
 local Server   = {}
@@ -336,6 +360,17 @@ H.fire = function(c, d)
         end
     end
 
+    -- opcjonalnie: odbierz licencje, które firma nadaje (Config.Licenses.removeOnFire)
+    local licenses = Config.Licenses or {}
+    if licenses.removeOnFire then
+        for _, def in ipairs(jobCfg(c).licenses or {}) do
+            if data.SetLicense(c.job, t.identifier, def.id, false) then
+                data.Hist(c.job, c.name, { type = 'license', action = 'remove', ssn = tostring(t.ssn), identifier = t.identifier,
+                    name = t.name, license = def.id, label = def.label })
+            end
+        end
+    end
+
     local gname = gradeName(c.job, t.grade)
     data.SetJob(t.identifier, Config.Unemployed.job, Config.Unemployed.grade)
     data.RemoveMember(c.job, t.identifier)
@@ -405,7 +440,17 @@ H.setLicense = function(c, d)
     if not def then return err('Nieznana licencja') end
 
     local t, e = target(c, d.ssn); if not t then return err(e) end
-    data.SetLicense(c.job, t.identifier, def.id, d.value == true)
+
+    local adding = d.value == true
+    local ok, why = data.SetLicense(c.job, t.identifier, def.id, adding)
+    if not ok then return err(why or 'Nie udało się zmienić licencji') end
+
+    -- wpis w historii: daje też datę nadania, którą panel pokazuje w oknie licencji
+    data.Hist(c.job, c.name, {
+        type = 'license', action = adding and 'add' or 'remove',
+        ssn = tostring(t.ssn), identifier = t.identifier, name = t.name,
+        license = def.id, label = def.label
+    })
     return { ok = true }
 end
 
@@ -916,7 +961,10 @@ AddEventHandler('onResourceStop', function(resource)
     data.Flush()
 end)
 
-MySQL.ready(function() data.Install() end)
+MySQL.ready(function()
+    local ok, e = pcall(data.Install)
+    if not ok then print(('^1[crp_bossmenu]^7 nie udało się przygotować tabel: %s'):format(tostring(e))) end
+end)
 
 -- Zgodność ze starym wywołaniem (np. Twoja komenda testowa)
 lib.callback.register('crp_jobcore:bossmenu:server:getBossmenuData', function(src)
@@ -933,4 +981,5 @@ lib.callback.register('crp_jobcore:bossmenu:server:getBossmenuData', function(sr
     return ok and payload or {}
 end)
 
-return { Server = Server, Actions = Actions }
+_G.crp_bossmenu_s_main = { Server = Server, Actions = Actions }
+return _G.crp_bossmenu_s_main

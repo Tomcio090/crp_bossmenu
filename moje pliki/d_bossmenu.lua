@@ -22,14 +22,30 @@ Config.PlayerAccount   = 'bank'       -- konto gracza przy wpłatach/wypłatach:
 
 -- ─────────────────────────────────────────────────────────────
 --  BAZA DANYCH – nazwy kolumn w tabeli graczy (ESX: users)
+--
+--  KAŻDĄ POZYCJĘ MOŻESZ ZAKOMENTOWAĆ – jeżeli nie masz takiej kolumny.
+--  Wtedy pole będzie puste w panelu, ale nic się nie wysypie
+--  (wcześniej brak `phone` wywalał cały plik s_data.lua przy starcie).
 -- ─────────────────────────────────────────────────────────────
 Config.Db = {
+    -- przedrostek wszystkich tabel zasobu: prefix .. nazwa -> crp_jobcore_bossmenu_members
+    -- zmieniasz tutaj (albo dodaj własny), a wszystkie zapytania podłapią nową nazwę
+    prefix     = 'crp_jobcore_bossmenu_',
+
     users      = 'users',
-    identifier = 'identifier',
+    identifier = 'identifier',    -- bez tego nic nie działa (domyślnie 'identifier')
     firstname  = 'firstname',
     lastname   = 'lastname',
-    ssn        = 'ssn',
-    --phone      = 'phone_number'
+    ssn        = 'ssn',           -- brak kolumny? zakomentuj – zamiast SSN użyjemy identifiera
+    -- phone   = 'phone_number'   -- brak kolumny? zakomentuj – telefon będzie pusty
+    -- job     = 'job',           -- domyślnie 'job'
+    -- grade   = 'job_grade'      -- domyślnie 'job_grade'
+
+    -- migrate = false            -- wyłącza jednorazowe przenoszenie danych ze starych tabel bossmenu_*
+
+    -- licencje: korzystamy z tabel ESX-a (esx_license), żeby widziały je też inne skrypty
+    userLicenses = 'user_licenses',   -- nadane licencje: type, owner, time
+    licenses     = 'licenses'         -- definicje licencji: type (albo name) + label
 }
 
 -- ─────────────────────────────────────────────────────────────
@@ -42,6 +58,18 @@ Config.Cache = {
     logLimit       = 300,   -- ile ostatnich wpisów historii / transakcji trzymać
     orderLimit     = 150,   -- ile ostatnich zamówień trzymać
     recordLimit    = 3000   -- ile wpisów dyscyplinarnych / awansów wczytać na firmę
+}
+
+-- ─────────────────────────────────────────────────────────────
+--  LICENCJE (tabele ESX: `licenses` + `user_licenses`)
+--  Panel nie trzyma już własnej tabeli licencji – czyta i zapisuje do ESX-a,
+--  dzięki czemu licencje widzą inne skrypty (MDT, policejob, esx_license...).
+-- ─────────────────────────────────────────────────────────────
+Config.Licenses = {
+    mustExist    = true,           -- nadanie wymaga definicji typu w tabeli `licenses` (jak w esx_license)
+    time         = -1,             -- -1 = bezterminowo (standard ESX)
+    removeOnFire = false,          -- czy przy zwolnieniu odbierać licencje z listy danej firmy
+    syncResource = 'esx_license'   -- jeśli działa, wołamy jego zdarzenie, żeby gracz online od razu widział zmianę
 }
 
 -- ─────────────────────────────────────────────────────────────
@@ -60,7 +88,6 @@ Config.Society = function(job) return 'society_' .. job end
 -- ─────────────────────────────────────────────────────────────
 Config.Jobs = {
     police = {
-        minGrade = 0,
         salaryMax = 180,
         features  = { licenses = true, badges = true, records = true },   -- co pokazać w panelu
         supplier  = false,                                                -- true = firma może publikować ofertę dla innych firm

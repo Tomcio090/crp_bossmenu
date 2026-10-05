@@ -10,11 +10,35 @@
       NUI -> serwer: 'bossmenu:<akcja>' (setGrade, fire, addRecord, deposit, ...)
 ]]
 
--- zabezpieczenie przed podwójnym załadowaniem (np. fxmanifest + require)
-if _G.crp_bossmenu_c_main then return {} end
-_G.crp_bossmenu_c_main = true
+--┌───────────────────────────────────────────────────────────────────────────┐
+--│  WCZYTYWANIE MODUŁÓW                                                      │
+--│  1) próbujemy `require` (Twój loader),                                     │
+--│  2) jeśli się nie uda – czytamy plik z folderu resource'a (LoadResourceFile),│
+--│  3) wynik ląduje w cache, więc każdy moduł wczyta się tylko raz.           │
+--│  Dzięki temu działa i z fxmanifestem, i z własnym loaderem.                │
+--└───────────────────────────────────────────────────────────────────────────┘
+local function loadModule(requirePath, fileName, cacheKey)
+    local cached = _G[cacheKey]
+    if type(cached) == 'table' then return cached end
 
-local Config = require('resources.bossmenu.d_bossmenu')
+    local ok, mod = pcall(require, requirePath)
+    if not ok or type(mod) ~= 'table' then
+        local source = LoadResourceFile(GetCurrentResourceName(), fileName)
+        if not source then
+            error(('[crp_bossmenu] nie mogę wczytać %s – sprawdź, czy plik jest w folderze resource (albo w fxmanifest.lua)')
+                :format(fileName))
+        end
+        mod = ((load or loadstring)(source, '@' .. fileName))()
+    end
+
+    _G[cacheKey] = mod
+    return mod
+end
+
+-- zabezpieczenie przed podwójnym załadowaniem (np. fxmanifest + require)
+if _G.crp_bossmenu_c_main then return _G.crp_bossmenu_c_main end
+
+local Config = loadModule('resources.bossmenu.d_bossmenu', 'd_bossmenu.lua', 'crp_bossmenu_config')
 local ESX = exports['es_extended']:getSharedObject()
 
 local points = {}
@@ -51,11 +75,13 @@ local function requestOpen(point)
     activePoint = point
     TriggerServerEvent('crp_bossmenu:server:open')
 
-    -- serwer nie odpowiedział (brak uprawnień / błąd) – wracamy na krzesło
-    SetTimeout(2500, function()
+    -- serwer nie odpowiedział (brak uprawnień / błąd) – wracamy na krzesło i mówimy o tym
+    SetTimeout(3000, function()
         if awaitingOpen then
             awaitingOpen = false
             resumeChair(point)
+            ESX.ShowNotification('Nie udało się otworzyć panelu – brak odpowiedzi serwera.')
+            print('^1[crp_bossmenu]^7 serwer nie odpowiedział na `crp_bossmenu:server:open` – zajrzyj w konsolę serwera (najczęściej błąd w s_data/s_main przy starcie).')
         end
     end)
 end
@@ -102,10 +128,15 @@ local ACTIONS = {
 
 local pending, nextId = {}, 0
 
-RegisterNUICallback('bossmenu:close', function(_, cb)
+-- uwaga: bossmenu.js wysyła zamknięcie na `close` (bez prefiksu), zo_bossmenu używał `bossmenu:close`
+-- – obsługujemy oba, żeby okno zawsze oddało fokus i zdjęło gracza z komputera
+local function onClose(_, cb)
     closePanel(false)
     cb({})
-end)
+end
+
+RegisterNUICallback('close', onClose)
+RegisterNUICallback('bossmenu:close', onClose)
 
 for _, action in ipairs(ACTIONS) do
     RegisterNUICallback('bossmenu:' .. action, function(data, cb)

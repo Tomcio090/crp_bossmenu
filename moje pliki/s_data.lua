@@ -9,14 +9,41 @@
       4. Naliczone godziny pracy lecą do bazy jednym zbiorczym zapytaniem (data.Flush)
          co Config.Cache.saveSeconds – a nie po jednym zapytaniu na gracza.
 
+    Nazwy tabel: Config.Db.prefix .. nazwa (domyślnie crp_jobcore_bossmenu_*).
+    Przy pierwszym starcie zasób sam przenosi dane ze starych tabel bossmenu_*, jeśli je znajdzie.
+
     Nic tu nie trzeba wywoływać ręcznie – reszta dzieje się w s_main.lua.
 ]]
 
--- zabezpieczenie przed podwójnym załadowaniem (np. fxmanifest + require)
-if _G.crp_bossmenu_s_data then return {} end
-_G.crp_bossmenu_s_data = true
+--┌───────────────────────────────────────────────────────────────────────────┐
+--│  WCZYTYWANIE MODUŁÓW                                                      │
+--│  1) próbujemy `require` (Twój loader),                                     │
+--│  2) jeśli się nie uda – czytamy plik z folderu resource'a (LoadResourceFile),│
+--│  3) wynik ląduje w cache, więc każdy moduł wczyta się tylko raz.           │
+--│  Dzięki temu działa i z fxmanifestem, i z własnym loaderem.                │
+--└───────────────────────────────────────────────────────────────────────────┘
+local function loadModule(requirePath, fileName, cacheKey)
+    local cached = _G[cacheKey]
+    if type(cached) == 'table' then return cached end
 
-local Config = require('resources.bossmenu.d_bossmenu')
+    local ok, mod = pcall(require, requirePath)
+    if not ok or type(mod) ~= 'table' then
+        local source = LoadResourceFile(GetCurrentResourceName(), fileName)
+        if not source then
+            error(('[crp_bossmenu] nie mogę wczytać %s – sprawdź, czy plik jest w folderze resource (albo w fxmanifest.lua)')
+                :format(fileName))
+        end
+        mod = ((load or loadstring)(source, '@' .. fileName))()
+    end
+
+    _G[cacheKey] = mod
+    return mod
+end
+
+-- zabezpieczenie przed podwójnym załadowaniem (np. fxmanifest + require)
+if _G.crp_bossmenu_s_data then return _G.crp_bossmenu_s_data end
+
+local Config = loadModule('resources.bossmenu.d_bossmenu', 'd_bossmenu.lua', 'crp_bossmenu_config')
 local ESX = exports['es_extended']:getSharedObject()
 
 local data = {}
@@ -24,13 +51,60 @@ local data = {}
 local DB  = Config.Db
 local LIM = Config.Cache
 
--- nazwy kolumn z konfiguracji, opakowane w apostrofy SQL (bez backticków w kodzie)
+--┌───────────────────────────────────────────────────────────────────────────┐
+--│  KOLUMNY Z CONFIG.Db                                                      │
+--│  Każda kolumna jest OPCJONALNA – jeśli jej nie ustawisz (albo zakomentujesz,│
+--│  bo nie masz jej w tabeli), nie wywala to zasobu: pole leci jako NULL,     │
+--│  a panel pokazuje pustą wartość. Kiedyś brak `phone` wysypywał cały plik.  │
+--└───────────────────────────────────────────────────────────────────────────┘
 local TICK = string.char(96)
-local function q(key) return TICK .. DB[key] .. TICK end
+local function wrap(name) return TICK .. (name or '') .. TICK end
+
+-- nazwa kolumny z Config.Db ('' / false / brak wpisu -> wartość domyślna)
+local function column(key, default)
+    local name = DB[key]
+    if name == nil or name == false or name == '' then return default end
+    return name
+end
+
+local LC  = Config.Licenses or {}                 -- ustawienia licencji (d_bossmenu.lua)
+local USERS = column('users', 'users')
+local IDENT = column('identifier', 'identifier')   -- bez tego nic nie działa, więc jest domyślne
+local SSN   = column('ssn', IDENT)                 -- brak kolumny SSN -> używamy identifiera
+local JOB   = column('job', 'job')
+local GRADE = column('grade', 'job_grade')
+
+-- tabele ESX-a (nie zakładamy ich sami – tylko z nich korzystamy)
+local USER_LICENSES = column('userLicenses', 'user_licenses')   -- nadane licencje
+local LICENSES_DEF  = column('licenses', 'licenses')            -- definicje licencji
+
+-- "`kolumna` AS alias" albo "NULL AS alias", gdy kolumny nie ma
+local function field(name, alias)
+    if not name then return 'NULL AS ' .. alias end
+    return ('%s AS %s'):format(wrap(name), alias)
+end
 
 -- lista kolumn gracza – sklejona raz, używana w kilku zapytaniach
-local USER_COLS = ('%s AS identifier, %s AS firstname, %s AS lastname, %s AS ssn, %s AS phone'):format(
-    q('identifier'), q('firstname'), q('lastname'), q('ssn'), q('phone'))
+local USER_COLS = table.concat({
+    field(IDENT, 'identifier'),
+    field(column('firstname'), 'firstname'),
+    field(column('lastname'), 'lastname'),
+    field(SSN, 'ssn'),
+    field(column('phone'), 'phone')
+}, ', ')
+
+-- informacja w konsoli o kolumnach, których nie ma w Config.Db (żeby nie było cichej niespodzianki).
+-- `users`, `identifier`, `job`, `grade` mają sensowne wartości domyślne, więc o nich nie krzyczymy.
+do
+    local missing = {}
+    for _, key in ipairs({ 'firstname', 'lastname', 'ssn', 'phone', 'userLicenses', 'licenses' }) do
+        if DB[key] == nil or DB[key] == false or DB[key] == '' then missing[#missing + 1] = key end
+    end
+    if #missing > 0 then
+        print(('^3[crp_bossmenu]^7 Config.Db bez kolumn: %s – te pola będą puste w panelu (nie blokuje działania)')
+            :format(table.concat(missing, ', ')))
+    end
+end
 
 -- formaty dat (wszystkie daty w cache trzymamy jako unix timestamp i formatujemy dopiero w payloadzie)
 local function asDate(ts)     return ts and os.date('%d.%m.%Y', ts) or '' end
@@ -41,85 +115,409 @@ local function secondsToHours(seconds)
     return math.floor(((seconds or 0) / 3600) * 10 + 0.5) / 10
 end
 
+-- Wartości liczbowe z bazy (kolumny INT) trafiają do JSON-a jako liczby, a interfejs
+-- porównuje SSN-y, odznaki i numery jako tekst (atrybuty `data-*` są zawsze tekstem).
+-- Dlatego wszystko, co jest identyfikatorem, wysyłamy do UI jako string.
+local function asText(value)
+    if value == nil then return nil end
+    return tostring(value)
+end
+
+-- dzieli listę na porcje (żeby zapytanie IN (...) nie było za długie)
+local function chunks(list, size)
+    local out, current = {}, {}
+    for _, value in ipairs(list) do
+        current[#current + 1] = value
+        if #current >= size then out[#out + 1] = current; current = {} end
+    end
+    if #current > 0 then out[#out + 1] = current end
+    return out
+end
+
 
 -- ═════════════════════════════════════════════════════════════
 --  SCHEMAT BAZY
 -- ═════════════════════════════════════════════════════════════
-local SCHEMA = {
-[[CREATE TABLE IF NOT EXISTS bossmenu_members (
-    identifier VARCHAR(60) NOT NULL, job VARCHAR(50) NOT NULL,
-    hired_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    badge INT NULL, seconds INT NOT NULL DEFAULT 0, last_duty DATETIME NULL,
-    note MEDIUMTEXT NULL, note_by VARCHAR(100) NULL, note_at DATETIME NULL,
-    PRIMARY KEY (identifier, job)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]],
+-- ═════════════════════════════════════════════════════════════
+--  NAZWY TABEL
+--  Każda tabela zasobu to Config.Db.prefix .. nazwa (np. crp_jobcore_bossmenu_members).
+--  Zmieniasz przedrostek w jednym miejscu w d_bossmenu.lua – reszta podstawia go sama.
+-- ═════════════════════════════════════════════════════════════
+local PREFIX = (DB.prefix ~= nil and DB.prefix ~= false) and DB.prefix or 'crp_jobcore_bossmenu_'
+local function T(name) return PREFIX .. name end
 
-[[CREATE TABLE IF NOT EXISTS bossmenu_licenses (
-    identifier VARCHAR(60) NOT NULL, job VARCHAR(50) NOT NULL, license VARCHAR(50) NOT NULL,
-    granted_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (identifier, job, license)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]],
+-- UWAGA: tabela licencji NIE jest nasza – to ESX-owe `user_licenses` (patrz data.SetLicense)
+local TABLES = { 'members', 'records', 'promotions', 'transactions', 'history',
+                 'settings', 'vehicles', 'orders', 'products' }
 
-[[CREATE TABLE IF NOT EXISTS bossmenu_records (
-    id INT AUTO_INCREMENT PRIMARY KEY, identifier VARCHAR(60) NOT NULL, job VARCHAR(50) NOT NULL,
-    kind VARCHAR(12) NOT NULL, reason VARCHAR(500) NOT NULL, by_name VARCHAR(100) NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    void_by VARCHAR(100) NULL, void_at DATETIME NULL, void_reason VARCHAR(500) NULL,
-    INDEX idx_emp (job, identifier)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]],
+-- stare nazwy tabel (bossmenu_*) – z nich zasób przenosi dane przy pierwszym starcie
+local OLD_PREFIX = 'bossmenu_'
 
-[[CREATE TABLE IF NOT EXISTS bossmenu_promotions (
-    id INT AUTO_INCREMENT PRIMARY KEY, identifier VARCHAR(60) NOT NULL, job VARCHAR(50) NOT NULL,
-    from_grade INT NOT NULL, to_grade INT NOT NULL, by_name VARCHAR(100) NOT NULL, reason VARCHAR(500) NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_emp (job, identifier)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]],
 
-[[CREATE TABLE IF NOT EXISTS bossmenu_transactions (
-    id INT AUTO_INCREMENT PRIMARY KEY, job VARCHAR(50) NOT NULL, type VARCHAR(3) NOT NULL,
-    amount BIGINT NOT NULL, by_name VARCHAR(100) NOT NULL, label VARCHAR(100) NOT NULL, reason VARCHAR(600) NULL,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_job (job, id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]],
+-- ═════════════════════════════════════════════════════════════
+--  SCHEMAT BAZY
+-- ═════════════════════════════════════════════════════════════
+-- ═════════════════════════════════════════════════════════════
+--  SCHEMAT BAZY
+--  Każda tabela jest opisana raz: `columns` to lista kolumn, `keys` to klucze i indeksy.
+--  Z tej samej listy kolumn zasób:
+--    * zakłada brakujące tabele (CREATE TABLE IF NOT EXISTS),
+--    * dokłada brakujące kolumny w tabelach po starszej wersji (data.AlignSchema),
+--  więc nic nie trzeba poprawiać ręcznie w bazie.
+-- ═════════════════════════════════════════════════════════════
+local TABLES_DEF = {
+    members = {
+        columns = {
+            'identifier VARCHAR(60) NOT NULL',
+            'job VARCHAR(50) NOT NULL',
+            'hired_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP',
+            'badge INT NULL',
+            'seconds INT NOT NULL DEFAULT 0',
+            'last_duty DATETIME NULL',
+            'note MEDIUMTEXT NULL',
+            'note_by VARCHAR(100) NULL',
+            'note_at DATETIME NULL'
+        },
+        keys = { 'PRIMARY KEY (identifier, job)' }
+    },
 
-[[CREATE TABLE IF NOT EXISTS bossmenu_history (
-    id INT AUTO_INCREMENT PRIMARY KEY, job VARCHAR(50) NOT NULL, by_name VARCHAR(100) NOT NULL, entry LONGTEXT NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_job (job, id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]],
+    records = {
+        columns = {
+            'id INT AUTO_INCREMENT PRIMARY KEY',
+            'identifier VARCHAR(60) NOT NULL',
+            'job VARCHAR(50) NOT NULL',
+            'kind VARCHAR(12) NOT NULL',
+            'reason VARCHAR(500) NOT NULL',
+            'by_name VARCHAR(100) NOT NULL',
+            'created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP',
+            'void_by VARCHAR(100) NULL',
+            'void_at DATETIME NULL',
+            'void_reason VARCHAR(500) NULL'
+        },
+        keys = { 'INDEX idx_emp (job, identifier)' }
+    },
 
-[[CREATE TABLE IF NOT EXISTS bossmenu_settings (
-    job VARCHAR(50) NOT NULL PRIMARY KEY, webhooks LONGTEXT NULL
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]],
+    promotions = {
+        columns = {
+            'id INT AUTO_INCREMENT PRIMARY KEY',
+            'identifier VARCHAR(60) NOT NULL',
+            'job VARCHAR(50) NOT NULL',
+            'from_grade INT NOT NULL',
+            'to_grade INT NOT NULL',
+            'by_name VARCHAR(100) NOT NULL',
+            'reason VARCHAR(500) NOT NULL',
+            'created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP'
+        },
+        keys = { 'INDEX idx_emp (job, identifier)' }
+    },
 
-[[CREATE TABLE IF NOT EXISTS bossmenu_vehicles (
-    plate VARCHAR(12) NOT NULL PRIMARY KEY, job VARCHAR(50) NOT NULL, model VARCHAR(50) NOT NULL,
-    name VARCHAR(100) NOT NULL, category VARCHAR(60) NULL,
-    assigned_identifier VARCHAR(60) NULL, assigned_at DATETIME NULL,
-    added_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_job (job)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]],
+    transactions = {
+        columns = {
+            'id INT AUTO_INCREMENT PRIMARY KEY',
+            'job VARCHAR(50) NOT NULL',
+            'type VARCHAR(3) NOT NULL',
+            'amount BIGINT NOT NULL',
+            'by_name VARCHAR(100) NOT NULL',
+            'label VARCHAR(100) NOT NULL',
+            'reason VARCHAR(600) NULL',
+            'created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP'
+        },
+        keys = { 'INDEX idx_job (job, id)' }
+    },
 
-[[CREATE TABLE IF NOT EXISTS bossmenu_orders (
-    id INT AUTO_INCREMENT PRIMARY KEY, kind VARCHAR(10) NOT NULL,
-    buyer_job VARCHAR(50) NOT NULL, supplier_job VARCHAR(50) NOT NULL,
-    items LONGTEXT NOT NULL, total BIGINT NOT NULL, status VARCHAR(12) NOT NULL DEFAULT 'pending',
-    note VARCHAR(300) NULL, reason VARCHAR(500) NULL, by_name VARCHAR(100) NOT NULL,
-    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    INDEX idx_buyer (buyer_job, id), INDEX idx_supplier (supplier_job, id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]],
+    history = {
+        columns = {
+            'id INT AUTO_INCREMENT PRIMARY KEY',
+            'job VARCHAR(50) NOT NULL',
+            'by_name VARCHAR(100) NOT NULL',
+            'entry LONGTEXT NOT NULL',
+            'created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP'
+        },
+        keys = { 'INDEX idx_job (job, id)' }
+    },
 
-[[CREATE TABLE IF NOT EXISTS bossmenu_products (
-    id INT AUTO_INCREMENT PRIMARY KEY, job VARCHAR(50) NOT NULL, name VARCHAR(100) NOT NULL,
-    category VARCHAR(60) NULL, descr VARCHAR(300) NULL, price BIGINT NOT NULL,
-    active TINYINT(1) NOT NULL DEFAULT 1, access LONGTEXT NULL,
-    INDEX idx_job (job)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4]]
+    settings = {
+        columns = {
+            'job VARCHAR(50) NOT NULL PRIMARY KEY',
+            'webhooks LONGTEXT NULL'
+        }
+    },
+
+    vehicles = {
+        columns = {
+            'plate VARCHAR(12) NOT NULL PRIMARY KEY',
+            'job VARCHAR(50) NOT NULL',
+            'model VARCHAR(50) NOT NULL',
+            'name VARCHAR(100) NOT NULL',
+            'category VARCHAR(60) NULL',
+            'assigned_identifier VARCHAR(60) NULL',
+            'assigned_at DATETIME NULL',
+            'added_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP'
+        },
+        keys = { 'INDEX idx_job (job)' }
+    },
+
+    orders = {
+        columns = {
+            'id INT AUTO_INCREMENT PRIMARY KEY',
+            'kind VARCHAR(10) NOT NULL',
+            'buyer_job VARCHAR(50) NOT NULL',
+            'supplier_job VARCHAR(50) NOT NULL',
+            'items LONGTEXT NOT NULL',
+            'total BIGINT NOT NULL',
+            'status VARCHAR(12) NOT NULL DEFAULT \'pending\'',
+            'note VARCHAR(300) NULL',
+            'reason VARCHAR(500) NULL',
+            'by_name VARCHAR(100) NOT NULL',
+            'created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP'
+        },
+        keys = { 'INDEX idx_buyer (buyer_job, id)', 'INDEX idx_supplier (supplier_job, id)' }
+    },
+
+    products = {
+        columns = {
+            'id INT AUTO_INCREMENT PRIMARY KEY',
+            'job VARCHAR(50) NOT NULL',
+            'name VARCHAR(100) NOT NULL',
+            'category VARCHAR(60) NULL',
+            'descr VARCHAR(300) NULL',
+            'price BIGINT NOT NULL',
+            'active TINYINT(1) NOT NULL DEFAULT 1',
+            'access LONGTEXT NULL'
+        },
+        keys = { 'INDEX idx_job (job)' }
+    }
 }
 
+-- gotowe polecenia CREATE z powyższego opisu
+local SCHEMA = {}
+for _, name in ipairs(TABLES) do
+    local def = TABLES_DEF[name]
+    local parts = {}
+    for _, column in ipairs(def.columns) do parts[#parts + 1] = column end
+    for _, key in ipairs(def.keys or {}) do parts[#parts + 1] = key end
+    SCHEMA[#SCHEMA + 1] = ('CREATE TABLE IF NOT EXISTS %s (%s) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4')
+        :format(T(name), table.concat(parts, ',\n        '))
+end
+
+data.Schema = TABLES_DEF
+
+
+-- ═════════════════════════════════════════════════════════════
+--  MIGRACJA ZE STARYCH TABEL (bossmenu_* → crp_jobcore_bossmenu_*)
+--  Robi coś tylko wtedy, gdy stare tabele faktycznie istnieją:
+--    * brak nowej tabeli                      → RENAME (dane zostają na miejscu),
+--    * nowa istnieje i jest pusta, stara ma   → przepisanie wierszy (INSERT IGNORE ... SELECT),
+--      dane
+--    * obie mają dane                         → nic nie ruszamy, tylko komunikat w konsoli.
+--  Wyłączyć można przez Config.Db.migrate = false.
+-- ═════════════════════════════════════════════════════════════
+local function tableExists(name)
+    return MySQL.scalar.await([[SELECT 1 FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? LIMIT 1]], { name }) ~= nil
+end
+
+local function rowCount(name)
+    return tonumber(MySQL.scalar.await(('SELECT COUNT(*) AS row_count FROM `%s`'):format(name))) or 0
+end
+
+-- kolumny wspólne obu tabelom (stara tabela po starszej wersji mogła mieć ich mniej)
+local function sharedColumns(first, second)
+    local function columnNames(table)
+        local rows = MySQL.query.await([[SELECT COLUMN_NAME FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION]], { table }) or {}
+        local list = {}
+        for _, row in ipairs(rows) do list[#list + 1] = row.COLUMN_NAME or row.column_name end
+        return list
+    end
+
+    local inFirst = {}
+    for _, columnName in ipairs(columnNames(first)) do inFirst[columnName] = true end
+
+    local out = {}
+    for _, columnName in ipairs(columnNames(second)) do
+        if inFirst[columnName] then out[#out + 1] = ('`%s`'):format(columnName) end
+    end
+    return out
+end
+
+function data.MigrateTables()
+    if DB.migrate == false or PREFIX == OLD_PREFIX then return end
+
+    local renamed, copied, skipped = {}, {}, {}
+    for _, name in ipairs(TABLES) do
+        local old, new = OLD_PREFIX .. name, T(name)
+        if tableExists(old) then
+            if not tableExists(new) then
+                local ok = pcall(function() MySQL.query.await(('RENAME TABLE `%s` TO `%s`'):format(old, new)) end)
+                if ok then renamed[#renamed + 1] = name end
+            else
+                local oldRows, newRows = rowCount(old), rowCount(new)
+                if newRows == 0 and oldRows > 0 then
+                    local columns = sharedColumns(old, new)          -- nie kopiujemy SELECT *, bo kolumny mogą się różnić
+                    local ok = #columns > 0 and pcall(function()
+                        local list = table.concat(columns, ', ')
+                        MySQL.query.await(('INSERT IGNORE INTO `%s` (%s) SELECT %s FROM `%s`'):format(new, list, list, old))
+                    end)
+                    if ok then copied[#copied + 1] = ('%s (%d)'):format(name, oldRows) else skipped[#skipped + 1] = name end
+                elseif oldRows > 0 and newRows > 0 then
+                    skipped[#skipped + 1] = name
+                end
+            end
+        end
+    end
+
+    if #renamed > 0 then
+        print(('^2[crp_bossmenu]^7 tabele przeniesione ze starych nazw: %s'):format(table.concat(renamed, ', ')))
+    end
+    if #copied > 0 then
+        print(('^2[crp_bossmenu]^7 dane przepisane ze starych tabel: %s'):format(table.concat(copied, ', ')))
+    end
+    if #skipped > 0 then
+        print(('^3[crp_bossmenu]^7 stare i nowe tabele mają dane jednocześnie (%s) – nic nie ruszam, przenieś ręcznie (patrz NOTATKI.md)')
+            :format(table.concat(skipped, ', ')))
+    end
+end
+
+-- Dokłada brakujące kolumny w tabelach, które zostały założone przez starszą wersję zasobu.
+-- Powód: CREATE TABLE IF NOT EXISTS istniejącej tabeli nie zmieni, a wtedy sypie się np.
+--   "Unknown column 'void_at' in 'SELECT'".
+-- Dokładamy wyłącznie brakujące kolumny – istniejących danych i typów nie ruszamy.
+function data.AlignSchema()
+    -- jedno zapytanie: które kolumny już są
+    local names, placeholders = {}, {}
+    for _, name in ipairs(TABLES) do
+        names[#names + 1] = T(name)
+        placeholders[#placeholders + 1] = '?'
+    end
+    local ok, rows = pcall(function()
+        return MySQL.query.await(([[SELECT TABLE_NAME, COLUMN_NAME FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME IN (%s)]]):format(table.concat(placeholders, ', ')), names)
+    end)
+    if not ok then
+        print(('^3[crp_bossmenu]^7 nie mogę sprawdzić kolumn tabel (%s) – pomijam'):format(tostring(rows)))
+        return {}
+    end
+    rows = rows or {}
+
+    local present = {}
+    for _, row in ipairs(rows) do
+        local table_  = row.TABLE_NAME or row.table_name        -- różne sterowniki zwracają raz tak, raz tak
+        local column_ = row.COLUMN_NAME or row.column_name
+        if table_ and column_ then
+            present[table_] = present[table_] or {}
+            present[table_][column_] = true
+        end
+    end
+
+    local added = {}
+    for _, name in ipairs(TABLES) do
+        local tableName = T(name)
+        local have = present[tableName]
+        if have then
+            local missing = {}
+            for _, definition in ipairs(TABLES_DEF[name].columns) do
+                local columnName = definition:match('^([%w_]+)')
+                if columnName and not have[columnName] then missing[#missing + 1] = definition end
+            end
+
+            if #missing > 0 then
+                local ok, e = pcall(function()
+                    MySQL.query.await(('ALTER TABLE `%s` ADD COLUMN %s'):format(tableName, table.concat(missing, ', ADD COLUMN ')))
+                end)
+                if ok then
+                    added[#added + 1] = ('%s (+%d)'):format(name, #missing)
+                else
+                    print(('^1[crp_bossmenu]^7 nie udało się dodać kolumn w %s: %s'):format(tableName, tostring(e)))
+                end
+            end
+        end
+    end
+
+    if #added > 0 then
+        print(('^2[crp_bossmenu]^7 brakujące kolumny dodane: %s'):format(table.concat(added, ', ')))
+    end
+    return added
+end
+
+-- kolacja, w jakiej mają być tabele bossmenu (taka sama jak w tabeli graczy).
+-- Na MariaDB 11+ nowe tabele dostają domyślnie utf8mb4_uca1400_ai_ci, a ESX-owe `users`
+-- mają najczęściej utf8mb4_general_ci → łączenie takich kolumn kończy się błędem:
+--   "Illegal mix of collations (utf8mb4_general_ci,IMPLICIT) and (utf8mb4_uca1400_ai_ci,IMPLICIT)"
+local COLLATION = 'utf8mb4_general_ci'
+
+local function tableCollation(name)
+    return MySQL.scalar.await([[SELECT TABLE_COLLATION FROM information_schema.TABLES
+        WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ?]], { name })
+end
+
+-- Kolacja musi być z rodziny utf8mb4, bo tabele bossmenu są w utf8mb4.
+-- Stare bazy ESX mają czasem utf8 (utf8mb3) / latin1 – wtedy bierzemy odpowiednik w utf8mb4,
+-- inaczej ALTER/JOIN poleciałby błędem "COLLATION ... is not valid for CHARACTER SET utf8mb4".
+local function normalizeCollation(name)
+    if type(name) ~= 'string' or name == '' then return nil end
+    if name:match('^utf8mb4_') then return name end
+    if name:match('^utf8mb3_') then return 'utf8mb4_' .. name:sub(9) end
+    if name:match('^utf8_') then return 'utf8mb4_' .. name:sub(6) end
+    return nil   -- latin1 / cp1250 / ... -> zostajemy przy bezpiecznym utf8mb4_general_ci
+end
+
+-- Ustawia tabelom bossmenu taką kolację, jaką ma tabela graczy (sprawdza się przy starcie).
+-- ustala kolację wzorcową (tabela graczy) – używane też przez migrację licencji
+function data.DetectCollation()
+    COLLATION = normalizeCollation(tableCollation(USERS)) or COLLATION
+    return COLLATION
+end
+
+function data.AlignCollation()
+    -- 1) kolacja tabeli graczy (ESX) – to jest nasz wzorzec
+    data.DetectCollation()
+
+    -- 2) wyrównaj tabele bossmenu, jeśli któraś ma inną kolację
+    local fixed = {}
+    for _, name in ipairs(TABLES) do
+        local tableName = T(name)
+        local current = tableCollation(tableName)
+        if current and COLLATION and current ~= COLLATION and COLLATION:match('^[%w_]+$') then
+            local ok, e = pcall(function()
+                MySQL.query.await(('ALTER TABLE `%s` CONVERT TO CHARACTER SET utf8mb4 COLLATE %s'):format(tableName, COLLATION))
+            end)
+            if ok then
+                fixed[#fixed + 1] = tableName
+            else
+                print(('^3[crp_bossmenu]^7 nie udało się wyrównać kolacji %s (%s) – JOIN-y mają własne COLLATE, więc działa dalej')
+                    :format(tableName, tostring(e)))
+            end
+        end
+    end
+    if #fixed > 0 then
+        print(('^2[crp_bossmenu]^7 kolacja %s dla: %s'):format(COLLATION, table.concat(fixed, ', ')))
+    end
+    return COLLATION
+end
+
+function data.Collation() return COLLATION end
+
+-- Każdy krok osobno: gdy jedna operacja na bazie się nie uda (np. brak prawa do ALTER),
+-- zasób i tak wystartuje, a w konsoli pojawi się konkretny powód.
 function data.Install()
-    for _, sql in ipairs(SCHEMA) do MySQL.query.await(sql) end
-    print('^2[crp_bossmenu]^7 tabele gotowe')
+    local function step(label, fn)
+        local ok, e = pcall(fn)
+        if not ok then print(('^1[crp_bossmenu]^7 %s: %s'):format(label, tostring(e))) end
+        return ok
+    end
+
+    step('kolacja wzorcowa (tabela graczy)', data.DetectCollation)
+    step('przenoszenie danych ze starych tabel', data.MigrateTables)
+    step('przenoszenie licencji do user_licenses', data.MigrateLicenses)
+    step('zakładanie brakujących tabel', function()
+        for _, sql in ipairs(SCHEMA) do MySQL.query.await(sql) end
+    end)
+    step('dokładanie brakujących kolumn', data.AlignSchema)
+    step('wyrównanie kolacji', data.AlignCollation)
+    step('sprawdzanie definicji licencji', data.CheckLicenseDefinitions)
+
+    print(('^2[crp_bossmenu]^7 tabele gotowe (%s*)'):format(PREFIX))
 end
 
 
@@ -159,14 +557,14 @@ end
 
 -- ───────── wczytywanie ─────────
 
--- pracownicy z bossmenu_members (odznaki, godziny, notatki)
+-- pracownicy z tabeli members (odznaki, godziny, notatki, zatrudnienie)
 function data.LoadMembers(job)
     local c = get(job)
-    local rows = MySQL.query.await([[
+    local rows = MySQL.query.await(([[
         SELECT identifier, badge, seconds,
                UNIX_TIMESTAMP(hired_at) AS hired_at, UNIX_TIMESTAMP(last_duty) AS last_duty,
                note, note_by, UNIX_TIMESTAMP(note_at) AS note_at
-        FROM bossmenu_members WHERE job = ?]], { job })
+        FROM %s WHERE job = ?]]):format(T('members')), { job })
 
     c.members = {}
     for _, r in ipairs(rows or {}) do
@@ -194,11 +592,11 @@ function data.Member(job, identifier)
     return m
 end
 
--- gwarantuje wiersz w bossmenu_members (np. gdy ktoś pracuje, a nigdy nie był w panelu)
+-- gwarantuje wiersz w tabeli members (np. gdy ktoś pracuje, a nigdy nie był w panelu)
 function data.EnsureRow(job, identifier)
     local m = data.Member(job, identifier)
     if m.exists then return m end
-    MySQL.insert.await('INSERT IGNORE INTO bossmenu_members (identifier, job) VALUES (?, ?)', { identifier, job })
+    MySQL.insert.await('INSERT IGNORE INTO ' .. T('members') .. ' (identifier, job) VALUES (?, ?)', { identifier, job })
     m.exists, m.hired_at = true, os.time()
     return m
 end
@@ -206,11 +604,15 @@ end
 -- lista pracowników z tabeli graczy (kto jest w tej pracy)
 function data.LoadRoster(job)
     local c = get(job)
-    local rows = MySQL.query.await(('SELECT %s, job_grade AS grade FROM %s WHERE job = ?')
-        :format(USER_COLS, q('users')), { job })
+    local rows = MySQL.query.await(('SELECT %s, %s FROM %s WHERE %s = ?')
+        :format(USER_COLS, field(GRADE, 'grade'), wrap(USERS), wrap(JOB)), { job })
 
     local roster = {}
-    for _, r in ipairs(rows or {}) do roster[r.identifier] = r end
+    for _, r in ipairs(rows or {}) do
+        r.ssn = asText(r.ssn) or r.identifier          -- SSN jako tekst (patrz asText)
+        r.grade = tonumber(r.grade) or 0
+        roster[r.identifier] = r
+    end
     c.roster, c.rosterLoaded, c.rosterStale = roster, true, false
     return roster
 end
@@ -223,7 +625,11 @@ end
 
 function data.RosterAdd(job, row)
     local c = cache[job]
-    if c and c.rosterLoaded then c.roster[row.identifier] = row end
+    if c and c.rosterLoaded then
+        row.ssn = asText(row.ssn) or row.identifier
+        row.grade = tonumber(row.grade) or 0
+        c.roster[row.identifier] = row
+    end
 end
 
 function data.RosterRemove(job, identifier)
@@ -244,41 +650,54 @@ function data.LoadExtras(job)
 
     c.licenses, c.records, c.promos, c.tx, c.history = {}, {}, {}, {}, {}
 
-    local lic = MySQL.query.await(
-        'SELECT identifier, license, UNIX_TIMESTAMP(granted_at) AS at FROM bossmenu_licenses WHERE job = ?', { job })
-    for _, r in ipairs(lic or {}) do
-        c.licenses[r.identifier] = c.licenses[r.identifier] or {}
-        c.licenses[r.identifier][r.license] = r.at
+    -- licencje: ESX-owa tabela `user_licenses` (owner = identifier gracza)
+    local owners, seen = {}, {}
+    for identifier in pairs(c.members or {}) do
+        if not seen[identifier] then seen[identifier] = true; owners[#owners + 1] = identifier end
+    end
+    for identifier in pairs(data.Roster(job)) do
+        if not seen[identifier] then seen[identifier] = true; owners[#owners + 1] = identifier end
+    end
+
+    for _, group in ipairs(chunks(owners, 400)) do
+        local placeholders = {}
+        for i = 1, #group do placeholders[i] = '?' end
+        local rows = MySQL.query.await(('SELECT owner, type, time FROM %s WHERE owner IN (%s)')
+            :format(wrap(USER_LICENSES), table.concat(placeholders, ', ')), group)
+        for _, r in ipairs(rows or {}) do
+            c.licenses[r.owner] = c.licenses[r.owner] or {}
+            c.licenses[r.owner][r.type] = r.time
+        end
     end
 
     local rec = MySQL.query.await(('SELECT id, identifier, kind, reason, by_name, UNIX_TIMESTAMP(created_at) AS at, \
-        void_by, UNIX_TIMESTAMP(void_at) AS void_at, void_reason FROM bossmenu_records \
-        WHERE job = ? ORDER BY id DESC LIMIT %d'):format(LIM.recordLimit), { job })
+        void_by, UNIX_TIMESTAMP(void_at) AS void_at, void_reason FROM %s \
+        WHERE job = ? ORDER BY id DESC LIMIT %d'):format(T('records'), LIM.recordLimit), { job })
     for _, r in ipairs(rec or {}) do
         local list = c.records[r.identifier] or {}; c.records[r.identifier] = list
         list[#list + 1] = r
     end
 
     local pro = MySQL.query.await(('SELECT identifier, from_grade, to_grade, by_name, reason, UNIX_TIMESTAMP(created_at) AS at \
-        FROM bossmenu_promotions WHERE job = ? ORDER BY id DESC LIMIT %d'):format(LIM.recordLimit), { job })
+        FROM %s WHERE job = ? ORDER BY id DESC LIMIT %d'):format(T('promotions'), LIM.recordLimit), { job })
     for _, r in ipairs(pro or {}) do
         local list = c.promos[r.identifier] or {}; c.promos[r.identifier] = list
         list[#list + 1] = r
     end
 
     local tx = MySQL.query.await(('SELECT type, amount, by_name, label, reason, UNIX_TIMESTAMP(created_at) AS at \
-        FROM bossmenu_transactions WHERE job = ? ORDER BY id DESC LIMIT %d'):format(LIM.logLimit), { job })
+        FROM %s WHERE job = ? ORDER BY id DESC LIMIT %d'):format(T('transactions'), LIM.logLimit), { job })
     for _, r in ipairs(tx or {}) do c.tx[#c.tx + 1] = r end
 
     local hist = MySQL.query.await(('SELECT entry, by_name, UNIX_TIMESTAMP(created_at) AS at \
-        FROM bossmenu_history WHERE job = ? ORDER BY id DESC LIMIT %d'):format(LIM.logLimit), { job })
+        FROM %s WHERE job = ? ORDER BY id DESC LIMIT %d'):format(T('history'), LIM.logLimit), { job })
     for _, r in ipairs(hist or {}) do
         local e = json.decode(r.entry) or {}
         e.by, e.at = r.by_name, r.at
         c.history[#c.history + 1] = e
     end
 
-    local hooks = MySQL.scalar.await('SELECT webhooks FROM bossmenu_settings WHERE job = ?', { job })
+    local hooks = MySQL.scalar.await('SELECT webhooks FROM ' .. T('settings') .. ' WHERE job = ?', { job })
     local h = hooks and json.decode(hooks) or {}
     c.webhooks = { plusminus = h.plusminus or '', commend = h.commend or '', promo = h.promo or '' }
 
@@ -295,10 +714,10 @@ function data.LoadVehicles(job)
     local rows = MySQL.query.await(([[
         SELECT v.plate, v.model, v.name, v.category, v.assigned_identifier,
                UNIX_TIMESTAMP(v.assigned_at) AS assigned_at, UNIX_TIMESTAMP(v.added_at) AS added_at,
-               u.%s AS assigned_ssn
-        FROM bossmenu_vehicles v
-        LEFT JOIN %s u ON u.%s = v.assigned_identifier
-        WHERE v.job = ? ORDER BY v.added_at DESC]]):format(q('ssn'), q('users'), q('identifier')), { job })
+               %s
+        FROM %s v
+        LEFT JOIN %s u ON u.%s = v.assigned_identifier COLLATE %s
+        WHERE v.job = ? ORDER BY v.added_at DESC]]):format(field(SSN, 'assigned_ssn'), T('vehicles'), wrap(USERS), wrap(IDENT), COLLATION), { job })
 
     for _, r in ipairs(rows or {}) do c.vehicles[#c.vehicles + 1] = r end
     c.vehiclesLoaded = true
@@ -318,10 +737,10 @@ local ORDER_COLS = [[
 
 function data.LoadOrders(job)
     local c = get(job)
-    local buyer = MySQL.query.await(('SELECT %s FROM bossmenu_orders WHERE buyer_job = ? ORDER BY id DESC LIMIT %d')
-        :format(ORDER_COLS, LIM.orderLimit), { job })
-    local supplier = MySQL.query.await(('SELECT %s FROM bossmenu_orders WHERE supplier_job = ? ORDER BY id DESC LIMIT %d')
-        :format(ORDER_COLS, LIM.orderLimit), { job })
+    local buyer = MySQL.query.await(('SELECT %s FROM %s WHERE buyer_job = ? ORDER BY id DESC LIMIT %d')
+        :format(ORDER_COLS, T('orders'), LIM.orderLimit), { job })
+    local supplier = MySQL.query.await(('SELECT %s FROM %s WHERE supplier_job = ? ORDER BY id DESC LIMIT %d')
+        :format(ORDER_COLS, T('orders'), LIM.orderLimit), { job })
 
     c.orders.buyer, c.orders.supplier = {}, {}
     for _, r in ipairs(buyer or {}) do
@@ -401,9 +820,9 @@ function data.Flush()
             end
         end
         if #values > 0 then
-            MySQL.update.await(('INSERT INTO bossmenu_members (identifier, job, seconds, last_duty) VALUES %s \
+            MySQL.update.await(('INSERT INTO %s (identifier, job, seconds, last_duty) VALUES %s \
                 ON DUPLICATE KEY UPDATE seconds = VALUES(seconds), last_duty = VALUES(last_duty)')
-                :format(table.concat(values, ', ')), params)
+                :format(T('members'), table.concat(values, ', ')), params)
             c.dirty = {}
         end
     end
@@ -421,9 +840,9 @@ function data.SetHired(job, identifier)
     m.hired_at, m.exists = os.time(), true
     get(job).dirty[identifier] = nil
 
-    MySQL.insert.await([[INSERT INTO bossmenu_members (identifier, job) VALUES (?, ?)
+    MySQL.insert.await(([[INSERT INTO %s (identifier, job) VALUES (?, ?)
         ON DUPLICATE KEY UPDATE hired_at = NOW(), badge = NULL, seconds = 0, last_duty = NULL,
-                                note = NULL, note_by = NULL, note_at = NULL]], { identifier, job })
+                                note = NULL, note_by = NULL, note_at = NULL]]):format(T('members')), { identifier, job })
 end
 
 function data.RemoveMember(job, identifier)
@@ -432,8 +851,10 @@ function data.RemoveMember(job, identifier)
     c.dirty[identifier] = nil
     c.licenses[identifier] = nil
 
-    MySQL.update.await('DELETE FROM bossmenu_members WHERE identifier = ? AND job = ?', { identifier, job })
-    MySQL.update.await('DELETE FROM bossmenu_licenses WHERE identifier = ? AND job = ?', { identifier, job })
+    MySQL.update.await('DELETE FROM ' .. T('members') .. ' WHERE identifier = ? AND job = ?', { identifier, job })
+    -- licencji NIE usuwamy: to wpisy w ESX-owym `user_licenses` (np. prawo jazdy),
+    -- które widzą inne skrypty. Przy zwolnieniu odbieramy tylko te z listy firmy –
+    -- decyduje Config.Licenses.removeOnFire (obsługa w s_main.lua).
 end
 
 function data.SetBadge(job, identifier, badge)
@@ -445,7 +866,7 @@ function data.SetBadge(job, identifier, badge)
     end
     local m = data.EnsureRow(job, identifier)
     m.badge = badge
-    MySQL.update.await('UPDATE bossmenu_members SET badge = ? WHERE identifier = ? AND job = ?', { badge, identifier, job })
+    MySQL.update.await('UPDATE ' .. T('members') .. ' SET badge = ? WHERE identifier = ? AND job = ?', { badge, identifier, job })
     return true
 end
 
@@ -453,27 +874,41 @@ function data.SetNote(job, identifier, html, by)
     local m = data.EnsureRow(job, identifier)
     if html == '' then
         m.note, m.note_by, m.note_at = nil, nil, nil
-        MySQL.update.await('UPDATE bossmenu_members SET note = NULL, note_by = NULL, note_at = NULL WHERE identifier = ? AND job = ?', { identifier, job })
+        MySQL.update.await('UPDATE ' .. T('members') .. ' SET note = NULL, note_by = NULL, note_at = NULL WHERE identifier = ? AND job = ?', { identifier, job })
     else
         m.note, m.note_by, m.note_at = html, by, os.time()
-        MySQL.update.await('UPDATE bossmenu_members SET note = ?, note_by = ?, note_at = NOW() WHERE identifier = ? AND job = ?', { html, by, identifier, job })
+        MySQL.update.await('UPDATE ' .. T('members') .. ' SET note = ?, note_by = ?, note_at = NOW() WHERE identifier = ? AND job = ?', { html, by, identifier, job })
     end
 end
 
+-- Nadanie / odebranie licencji w ESX-owej tabeli `user_licenses`.
+-- Zwraca true albo false, powód.
 function data.SetLicense(job, identifier, license, on)
     local c = get(job)
     c.licenses[identifier] = c.licenses[identifier] or {}
+
     if on then
-        c.licenses[identifier][license] = os.time()
-        MySQL.insert.await('INSERT IGNORE INTO bossmenu_licenses (identifier, job, license) VALUES (?, ?, ?)', { identifier, job, license })
+        -- zabezpieczenie jak w esx_license: typu musi być wpisany w tabeli `licenses`
+        if LC.mustExist ~= false and not data.LicenseExists(license) then
+            return false, ('Licencji "%s" nie ma w tabeli `%s` – najpierw dodaj definicję'):format(license, LICENSES_DEF)
+        end
+
+        c.licenses[identifier][license] = LC.time or -1
+        MySQL.insert.await(('INSERT INTO %s (type, owner, time) VALUES (?, ?, ?)')
+            :format(wrap(USER_LICENSES)), { license, identifier, LC.time or -1 })
+        data.SyncLicense(identifier, license, true)
     else
         c.licenses[identifier][license] = nil
-        MySQL.update.await('DELETE FROM bossmenu_licenses WHERE identifier = ? AND job = ? AND license = ?', { identifier, job, license })
+        MySQL.update.await(('DELETE FROM %s WHERE owner = ? AND type = ?')
+            :format(wrap(USER_LICENSES)), { identifier, license })
+        data.SyncLicense(identifier, license, false)
     end
+
+    return true
 end
 
 function data.AddRecord(job, identifier, kind, reason, by)
-    local id = MySQL.insert.await('INSERT INTO bossmenu_records (identifier, job, kind, reason, by_name) VALUES (?, ?, ?, ?, ?)',
+    local id = MySQL.insert.await('INSERT INTO ' .. T('records') .. ' (identifier, job, kind, reason, by_name) VALUES (?, ?, ?, ?, ?)',
         { identifier, job, kind, reason, by })
 
     local c = get(job)
@@ -485,7 +920,7 @@ end
 
 function data.VoidRecord(job, recordId, by, reason)
     local affected = MySQL.update.await(
-        'UPDATE bossmenu_records SET void_by = ?, void_at = NOW(), void_reason = ? WHERE id = ? AND job = ? AND void_by IS NULL',
+        'UPDATE ' .. T('records') .. ' SET void_by = ?, void_at = NOW(), void_reason = ? WHERE id = ? AND job = ? AND void_by IS NULL',
         { by, reason, recordId, job })
     if affected ~= 1 then return false end
 
@@ -501,7 +936,7 @@ function data.VoidRecord(job, recordId, by, reason)
 end
 
 function data.AddPromotion(job, identifier, from, to, by, reason)
-    MySQL.insert.await('INSERT INTO bossmenu_promotions (identifier, job, from_grade, to_grade, by_name, reason) VALUES (?, ?, ?, ?, ?, ?)',
+    MySQL.insert.await('INSERT INTO ' .. T('promotions') .. ' (identifier, job, from_grade, to_grade, by_name, reason) VALUES (?, ?, ?, ?, ?, ?)',
         { identifier, job, from, to, by, reason })
 
     local c = get(job)
@@ -511,7 +946,7 @@ function data.AddPromotion(job, identifier, from, to, by, reason)
 end
 
 function data.SetJob(identifier, job, grade)
-    MySQL.update.await(('UPDATE %s SET job = ?, job_grade = ? WHERE %s = ?'):format(q('users'), q('identifier')),
+    MySQL.update.await(('UPDATE %s SET %s = ?, %s = ? WHERE %s = ?'):format(wrap(USERS), wrap(JOB), wrap(GRADE), wrap(IDENT)),
         { job, grade, identifier })
 
     local x = ESX.GetPlayerFromIdentifier(identifier)
@@ -532,11 +967,137 @@ end
 
 
 -- ═════════════════════════════════════════════════════════════
+--  LICENCJE (ESX: `licenses` = definicje, `user_licenses` = nadane)
+-- ═════════════════════════════════════════════════════════════
+
+-- W różnych wersjach ESX-a definicje mają kolumnę `type` albo `name` – wykrywamy raz.
+local LICENSE_DEF_COLUMN
+local function licenseDefColumn()
+    if LICENSE_DEF_COLUMN ~= nil then return LICENSE_DEF_COLUMN or nil end
+
+    for _, column_ in ipairs({ 'type', 'name' }) do
+        local found = MySQL.scalar.await([[SELECT 1 FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ? LIMIT 1]],
+            { LICENSES_DEF, column_ })
+        if found then
+            LICENSE_DEF_COLUMN = column_
+            return column_
+        end
+    end
+
+    LICENSE_DEF_COLUMN = false
+    return nil
+end
+
+-- czy typ licencji ma definicję w tabeli `licenses`
+function data.LicenseExists(license)
+    local column_ = licenseDefColumn()
+    if not column_ then return false end
+    return MySQL.scalar.await(('SELECT 1 FROM %s WHERE %s = ? LIMIT 1')
+        :format(wrap(LICENSES_DEF), wrap(column_)), { license }) ~= nil
+end
+
+-- Przy starcie wypisuje, których licencji z Config.Jobs nie ma w tabeli `licenses`,
+-- i podaje gotowy SQL do wklejenia.
+function data.CheckLicenseDefinitions()
+    if LC.mustExist == false then return end
+
+    if not licenseDefColumn() then
+        print(('^3[crp_bossmenu]^7 nie widzę tabeli `%s` (definicje licencji) – sprawdź Config.Db.licenses, '
+            .. 'bez niej nadawanie licencji z panelu nie zadziała'):format(LICENSES_DEF))
+        return
+    end
+
+    local missing, seen = {}, {}
+    for _, jobCfg in pairs(Config.Jobs) do
+        for _, def in ipairs(jobCfg.licenses or {}) do
+            if def.id and not seen[def.id] and not data.LicenseExists(def.id) then
+                seen[def.id] = true
+                missing[#missing + 1] = def
+            end
+        end
+    end
+    if #missing == 0 then return end
+
+    local values = {}
+    for _, def in ipairs(missing) do
+        values[#values + 1] = ("('%s', '%s')"):format(def.id, (def.label or def.id):gsub("'", "''"))
+    end
+    print(('^3[crp_bossmenu]^7 brak definicji licencji w tabeli `%s`: %s')
+        :format(LICENSES_DEF, table.concat((function()
+            local ids = {}
+            for _, def in ipairs(missing) do ids[#ids + 1] = def.id end
+            return ids
+        end)(), ', ')))
+    print(('^3[crp_bossmenu]^7 dodaj je np. tak: INSERT IGNORE INTO %s (type, label) VALUES %s;')
+        :format(LICENSES_DEF, table.concat(values, ', ')))
+end
+
+-- Jeśli działa esx_license, wołamy jego zdarzenie, żeby gracz online od razu widział zmianę.
+-- (Zapis do bazy i tak jest źródłem prawdy – inne skrypty czytają `user_licenses`.)
+function data.SyncLicense(identifier, license, add)
+    local resource = LC.syncResource
+    if not resource or resource == false then return end
+    if GetResourceState(resource) ~= 'started' then return end
+
+    local x = ESX.GetPlayerFromIdentifier(identifier)
+    if not x or not x.source then return end            -- tylko dla graczy online
+
+    TriggerEvent(add and 'esx_license:addLicense' or 'esx_license:removeLicense', x.source, license)
+end
+
+-- Historia panelu → data nadania licencji (żeby UI pokazało „od …”; ESX nie ma takiej kolumny).
+local function licenseGrantDates(c)
+    local out = {}
+    for _, entry in ipairs(c.history) do          -- historia jest od najnowszych
+        if entry.type == 'license' and entry.action == 'add' and entry.ssn and entry.license then
+            local key = asText(entry.ssn)
+            out[key] = out[key] or {}
+            if not out[key][entry.license] then out[key][entry.license] = entry.at end
+        end
+    end
+    return out
+end
+
+-- Stare licencje panelu (bossmenu_licenses / crp_jobcore_bossmenu_licenses) → `user_licenses`.
+-- Nic nie kasujemy: po weryfikacji możesz usunąć starą tabelę ręcznie.
+function data.MigrateLicenses()
+    local candidates = { T('licenses'), OLD_PREFIX .. 'licenses' }
+
+    for _, old in ipairs(candidates) do
+        if tableExists(old) and old ~= USER_LICENSES then
+            local count = rowCount(old)
+            if count > 0 then
+                local col = LICENSE_DEF_COLUMN ~= false and licenseDefColumn() or nil
+                local ok, moved = pcall(function()
+                    return MySQL.update.await(('INSERT INTO %s (type, owner, time) \n' ..
+                        'SELECT l.license, l.identifier, ? FROM %s l \n' ..
+                        'WHERE NOT EXISTS (SELECT 1 FROM %s u WHERE u.owner = l.identifier AND u.type = l.license)')
+                        :format(wrap(USER_LICENSES), wrap(old), wrap(USER_LICENSES)), { LC.time or -1 })
+                end)
+                if ok then
+                    print(('^2[crp_bossmenu]^7 licencje przepisane z %s do %s (%s wierszy)')
+                        :format(old, USER_LICENSES, tostring(moved or count)))
+                    if not col then
+                        print(('^3[crp_bossmenu]^7 uwaga: dodaj typy licencji do tabeli `%s`, inaczej panel ich nie nada ponownie')
+                            :format(LICENSES_DEF))
+                    end
+                    print(('^3[crp_bossmenu]^7 gdy wszystko działa, możesz usunąć starą tabelę: DROP TABLE `%s`;'):format(old))
+                else
+                    print(('^3[crp_bossmenu]^7 nie udało się przepisać licencji z %s (%s)'):format(old, tostring(moved)))
+                end
+            end
+        end
+    end
+end
+
+
+-- ═════════════════════════════════════════════════════════════
 --  HISTORIA / TRANSAKCJE / WEBHOOKI
 -- ═════════════════════════════════════════════════════════════
 
 function data.Tx(job, type_, amount, by, label, reason)
-    MySQL.insert.await('INSERT INTO bossmenu_transactions (job, type, amount, by_name, label, reason) VALUES (?, ?, ?, ?, ?, ?)',
+    MySQL.insert.await('INSERT INTO ' .. T('transactions') .. ' (job, type, amount, by_name, label, reason) VALUES (?, ?, ?, ?, ?, ?)',
         { job, type_, amount, by, label, reason })
 
     local c = get(job)
@@ -547,7 +1108,7 @@ function data.Tx(job, type_, amount, by, label, reason)
 end
 
 function data.Hist(job, by, entry)
-    MySQL.insert.await('INSERT INTO bossmenu_history (job, by_name, entry) VALUES (?, ?, ?)',
+    MySQL.insert.await('INSERT INTO ' .. T('history') .. ' (job, by_name, entry) VALUES (?, ?, ?)',
         { job, by, json.encode(entry) })
 
     local c = get(job)
@@ -563,7 +1124,7 @@ function data.Hooks(job)
 end
 
 function data.SetHooks(job, hooks)
-    MySQL.insert.await('INSERT INTO bossmenu_settings (job, webhooks) VALUES (?, ?) ON DUPLICATE KEY UPDATE webhooks = VALUES(webhooks)',
+    MySQL.insert.await('INSERT INTO ' .. T('settings') .. ' (job, webhooks) VALUES (?, ?) ON DUPLICATE KEY UPDATE webhooks = VALUES(webhooks)',
         { job, json.encode(hooks) })
     get(job).webhooks = hooks
 end
@@ -601,14 +1162,21 @@ end
 -- ═════════════════════════════════════════════════════════════
 --  GRACZE (odczyt z tabeli graczy – tylko dla akcji, nie dla panelu)
 -- ═════════════════════════════════════════════════════════════
+local function normalizePlayer(row)
+    if not row then return nil end
+    row.ssn = asText(row.ssn) or asText(row.identifier)
+    row.grade = tonumber(row.grade) or 0
+    return row
+end
+
 function data.FindBySsn(ssn)
-    return MySQL.single.await(('SELECT %s, job, job_grade AS grade FROM %s WHERE %s = ? LIMIT 1')
-        :format(USER_COLS, q('users'), q('ssn')), { ssn })
+    return normalizePlayer(MySQL.single.await(('SELECT %s, job, job_grade AS grade FROM %s WHERE %s = ? LIMIT 1')
+        :format(USER_COLS, wrap(USERS), wrap(SSN)), { asText(ssn) }))
 end
 
 function data.FindByIdentifier(identifier)
-    return MySQL.single.await(('SELECT %s, job, job_grade AS grade FROM %s WHERE %s = ? LIMIT 1')
-        :format(USER_COLS, q('users'), q('identifier')), { identifier })
+    return normalizePlayer(MySQL.single.await(('SELECT %s, job, job_grade AS grade FROM %s WHERE %s = ? LIMIT 1')
+        :format(USER_COLS, wrap(USERS), wrap(IDENT)), { identifier }))
 end
 
 function data.JobLabel(job)
@@ -644,7 +1212,7 @@ function data.Products(job)
     local list = products[job]
     if not list then
         list = {}
-        local rows = MySQL.query.await('SELECT id, name, category, descr, price, active, access FROM bossmenu_products WHERE job = ? ORDER BY id', { job })
+        local rows = MySQL.query.await('SELECT id, name, category, descr, price, active, access FROM ' .. T('products') .. ' WHERE job = ? ORDER BY id', { job })
         for _, p in ipairs(rows or {}) do
             list[#list + 1] = {
                 id = p.id, name = p.name, category = p.category or '', desc = p.descr or '',
@@ -659,21 +1227,21 @@ end
 function data.InvalidateProducts(job) products[job] = nil end
 
 function data.FindProduct(job, id)
-    return MySQL.single.await('SELECT id, name, price, active, access FROM bossmenu_products WHERE id = ? AND job = ?', { id, job })
+    return MySQL.single.await('SELECT id, name, price, active, access FROM ' .. T('products') .. ' WHERE id = ? AND job = ?', { id, job })
 end
 
 function data.ProductNameExists(job, name, id)
-    return MySQL.scalar.await('SELECT 1 FROM bossmenu_products WHERE job = ? AND LOWER(name) = LOWER(?) AND id <> ? LIMIT 1',
+    return MySQL.scalar.await('SELECT 1 FROM ' .. T('products') .. ' WHERE job = ? AND LOWER(name) = LOWER(?) AND id <> ? LIMIT 1',
         { job, name, id or 0 }) ~= nil
 end
 
 function data.SaveProduct(job, id, p)
     local access = p.access and json.encode(p.access) or nil
     if id then
-        MySQL.update.await('UPDATE bossmenu_products SET name = ?, category = ?, descr = ?, price = ?, active = ?, access = ? WHERE id = ? AND job = ?',
+        MySQL.update.await('UPDATE ' .. T('products') .. ' SET name = ?, category = ?, descr = ?, price = ?, active = ?, access = ? WHERE id = ? AND job = ?',
             { p.name, p.category, p.desc, p.price, p.active and 1 or 0, access, id, job })
     else
-        id = MySQL.insert.await('INSERT INTO bossmenu_products (job, name, category, descr, price, active, access) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        id = MySQL.insert.await('INSERT INTO ' .. T('products') .. ' (job, name, category, descr, price, active, access) VALUES (?, ?, ?, ?, ?, ?, ?)',
             { job, p.name, p.category, p.desc, p.price, p.active and 1 or 0, access })
     end
     data.InvalidateProducts(job)
@@ -681,7 +1249,7 @@ function data.SaveProduct(job, id, p)
 end
 
 function data.DeleteProduct(job, id)
-    MySQL.update.await('DELETE FROM bossmenu_products WHERE id = ? AND job = ?', { id, job })
+    MySQL.update.await('DELETE FROM ' .. T('products') .. ' WHERE id = ? AND job = ?', { id, job })
     data.InvalidateProducts(job)
 end
 
@@ -692,7 +1260,7 @@ end
 
 function data.NewOrder(kind, buyerJob, supplierJob, items, total, by, note)
     local id = MySQL.insert.await(
-        'INSERT INTO bossmenu_orders (kind, buyer_job, supplier_job, items, total, note, by_name) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO ' .. T('orders') .. ' (kind, buyer_job, supplier_job, items, total, note, by_name) VALUES (?, ?, ?, ?, ?, ?, ?)',
         { kind, buyerJob, supplierJob, json.encode(items), total, note, by })
 
     -- dorzucamy zamówienie do pamięci obu firm (jeśli już wczytana) – bez ponownego SELECT-a
@@ -710,13 +1278,13 @@ end
 
 -- field = 'buyer_job' albo 'supplier_job'
 function data.GetOrder(id, kind, field, job)
-    return MySQL.single.await(('SELECT id, kind, buyer_job, supplier_job, items, total, status FROM bossmenu_orders \
-        WHERE id = ? AND %s = ? AND kind = ?'):format(field), { id, job, kind })
+    return MySQL.single.await(('SELECT id, kind, buyer_job, supplier_job, items, total, status FROM %s \
+        WHERE id = ? AND %s = ? AND kind = ?'):format(T('orders'), field), { id, job, kind })
 end
 
 function data.SetOrderStatus(id, field, job, from, to, reason, buyerJob, supplierJob)
-    local affected = MySQL.update.await(('UPDATE bossmenu_orders SET status = ?, reason = COALESCE(?, reason) \
-        WHERE id = ? AND %s = ? AND status = ?'):format(field), { to, reason, id, job, from })
+    local affected = MySQL.update.await(('UPDATE %s SET status = ?, reason = COALESCE(?, reason) \
+        WHERE id = ? AND %s = ? AND status = ?'):format(T('orders'), field), { to, reason, id, job, from })
     if affected ~= 1 then return false end
 
     -- ten sam status w pamięci obu firm (bez ponownego SELECT-a)
@@ -742,7 +1310,7 @@ end
 -- ═════════════════════════════════════════════════════════════
 
 function data.AddVehicle(job, plate, model, name, category)
-    MySQL.insert.await('INSERT INTO bossmenu_vehicles (plate, job, model, name, category) VALUES (?, ?, ?, ?, ?)',
+    MySQL.insert.await('INSERT INTO ' .. T('vehicles') .. ' (plate, job, model, name, category) VALUES (?, ?, ?, ?, ?)',
         { plate, job, model, name, category })
 
     local c = get(job)
@@ -752,13 +1320,13 @@ function data.AddVehicle(job, plate, model, name, category)
 end
 
 function data.SetVehicleOwner(job, plate, identifier, ssn)
-    MySQL.update.await('UPDATE bossmenu_vehicles SET assigned_identifier = ?, assigned_at = NOW() WHERE plate = ?',
+    MySQL.update.await('UPDATE ' .. T('vehicles') .. ' SET assigned_identifier = ?, assigned_at = NOW() WHERE plate = ?',
         { identifier, plate })
 
     local c = get(job)
     for _, v in ipairs(c.vehicles) do
         if v.plate == plate then
-            v.assigned_identifier, v.assigned_ssn = identifier, ssn
+            v.assigned_identifier, v.assigned_ssn = identifier, asText(ssn)
             v.assigned_at = identifier and os.time() or nil
             break
         end
@@ -792,7 +1360,7 @@ function data.NewPlate()
             :gsub('A', function() return string.char(math.random(65, 90)) end)
             :gsub('0', function() return tostring(math.random(0, 9)) end)
 
-        local taken = MySQL.scalar.await('SELECT 1 FROM bossmenu_vehicles WHERE plate = ?', { plate })
+        local taken = MySQL.scalar.await('SELECT 1 FROM ' .. T('vehicles') .. ' WHERE plate = ?', { plate })
         if not taken then
             local ok, r = pcall(function() return MySQL.scalar.await('SELECT 1 FROM owned_vehicles WHERE plate = ?', { plate }) end)
             if not ok or not r then return plate end
@@ -805,7 +1373,7 @@ end
 -- ═════════════════════════════════════════════════════════════
 --  PACZKA DLA UI (to leci do klienta przy otwarciu i odświeżeniu)
 -- ═════════════════════════════════════════════════════════════
-local function buildEmployee(c, job, identifier, u)
+local function buildEmployee(c, job, identifier, u, granted)
     local m = c.members[identifier]
 
     -- gracz online ma zawsze aktualny stopień/status i nie pokazujemy go, jeśli zmienił pracę
@@ -820,14 +1388,14 @@ local function buildEmployee(c, job, identifier, u)
     local lastSeen = m and (m.last_duty or m.hired_at) or nil
 
     local e = {
-        ssn         = u.ssn or identifier,
+        ssn         = asText(u.ssn) or identifier,      -- zawsze tekst: UI dopasowuje pracownika po SSN
         firstname   = u.firstname or '',
         lastname    = u.lastname or '',
-        phonenumber = u.phone or '',
-        grade       = grade,
+        phonenumber = u.phone and asText(u.phone) or '',
+        grade       = tonumber(grade) or 0,
         status      = status,
         lastSeen    = status == 'off' and math.max(0, math.floor((os.time() - (lastSeen or os.time())) / 60)) or 0,
-        badge       = m and m.badge or nil,
+        badge       = m and m.badge ~= nil and tonumber(m.badge) or nil,
         hiredAt     = asDate((m and m.hired_at) or os.time()),
         hoursWeek   = secondsToHours(seconds),
         licenses    = {}, records = {}, promotions = {}
@@ -837,9 +1405,17 @@ local function buildEmployee(c, job, identifier, u)
         e.note = { html = m.note, by = m.note_by or '—', at = asDateTime(m.note_at) }
     end
 
-    for license, at in pairs(c.licenses[identifier] or {}) do
-        e.licenses[#e.licenses + 1] = { id = license, at = asDate(at) }
+    -- licencje z ESX-owego `user_licenses`; data nadania z historii panelu (gdy nadano w panelu),
+    -- a gdy wpis ma termin ważności (time > 0) – pokazujemy tę datę
+    local ssnKey = e.ssn
+    for license, timeLeft in pairs(c.licenses[identifier] or {}) do
+        local at = granted[ssnKey] and granted[ssnKey][license]   -- unix (wpis z historii panelu)
+        local date
+        if at then date = asDate(at)
+        elseif timeLeft and timeLeft > 0 then date = asDate(timeLeft) end   -- licencja z terminem ważności
+        e.licenses[#e.licenses + 1] = { id = license, at = date or '' }
     end
+    table.sort(e.licenses, function(a, b) return a.id < b.id end)
     for _, r in ipairs(c.records[identifier] or {}) do
         e.records[#e.records + 1] = {
             id = r.id, kind = r.kind, by = r.by_name, reason = r.reason, at = asDateTime(r.at),
@@ -889,8 +1465,9 @@ function data.Build(s)
 
     -- ── pracownicy ──
     local employees = {}
+    local granted = licenseGrantDates(c)
     for identifier, u in pairs(c.roster) do
-        local e = buildEmployee(c, job, identifier, u)
+        local e = buildEmployee(c, job, identifier, u, granted)
         if e then employees[#employees + 1] = e end
     end
     table.sort(employees, function(a, b)
@@ -903,7 +1480,7 @@ function data.Build(s)
     for _, v in ipairs(data.Vehicles(job)) do
         vehicles[#vehicles + 1] = {
             plate = v.plate, model = v.model, name = v.name, category = v.category or '',
-            assignedTo = v.assigned_ssn, assignedAt = asDateTime(v.assigned_at), addedAt = asDateTime(v.added_at)
+            assignedTo = asText(v.assigned_ssn), assignedAt = asDateTime(v.assigned_at), addedAt = asDateTime(v.added_at)
         }
     end
 
@@ -962,7 +1539,8 @@ function data.Build(s)
 
     return {
         job         = { name = job, label = data.JobLabel(job) },
-        me          = { ssn = s.ssn, firstname = s.firstname, lastname = s.lastname, grade = s.grade },
+        me          = { ssn = asText(s.ssn) or '', firstname = s.firstname, lastname = s.lastname,
+                        grade = tonumber(s.grade) or 0 },
         features    = jc.features or {},
         licenseDefs = jc.licenses or {},
         grades      = data.Grades(job),
@@ -987,4 +1565,5 @@ function data.Build(s)
     }
 end
 
+_G.crp_bossmenu_s_data = data
 return data

@@ -146,7 +146,8 @@ function fmtAt(str, short = false) {
     const h = +hh, time = CFG.timeFmt === '12' ? `${h % 12 || 12}:${mi} ${h < 12 ? 'AM' : 'PM'}` : `${hh}:${mi}`;
     return `${date} ${time}`;
 }
-const getEmp = ssn => S.employees.find(e => e.ssn === ssn);
+const sameSsn = (a, b) => String(a ?? '') === String(b ?? '');     // SSN z bazy bywa liczbą, a z HTML zawsze tekstem
+const getEmp = ssn => S.employees.find(e => sameSsn(e.ssn, ssn));
 const today = () => { const d = new Date(); return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()}`; };
 const ago = m => m < 1 ? 'teraz' : m < 60 ? `${m} min temu` : m < 1440 ? `${Math.floor(m / 60)} godz. temu` : `${Math.floor(m / 1440)} dni temu`;
 const stamp = () => { const d = new Date(); return `${pad(d.getDate())}.${pad(d.getMonth() + 1)} ${pad(d.getHours())}:${pad(d.getMinutes())}`; };
@@ -569,7 +570,7 @@ const REC_GROUPS = {
 
 function appEmployees() {
     if (EMP.view === 'profile') {
-        const e = S.employees.find(x => x.ssn === EMP.ssn);
+        const e = getEmp(EMP.ssn);
         if (e) return viewProfile(e);
         EMP.view = 'list';
     }
@@ -601,7 +602,7 @@ function viewList() {
         return `<span class="font-bold ${st.text}">${st.label}</span>${k === 'off' ? `<span class="text-slate-600"> · ${esc(sinceOff(e))}</span>` : ''}`;
     };
     const rows = list.map(e => {
-        const boss = isBossGrade(e.grade), self = e.ssn === S.me.ssn;
+        const boss = isBossGrade(e.grade), self = sameSsn(e.ssn, S.me.ssn);
         return `
         <tr data-act="openProfile" data-ssn="${e.ssn}" class="group border-t border-slate-800/70 hover:bg-slate-800/40 cursor-pointer transition">
             <td class="py-2 pl-4 pr-2">
@@ -710,9 +711,27 @@ function toggleSelect(id) {
     panel.classList.toggle('hidden', !open);
     $('[data-select-arrow]', w).classList.toggle('rotate-180', open);
     panel.classList.remove('bottom-full', 'mb-1.5'); panel.classList.add('mt-1.5');
-    if (open && panel.getBoundingClientRect().bottom > $('#os').getBoundingClientRect().bottom - 8) {   // brak miejsca – otwórz w górę
-        panel.classList.remove('mt-1.5'); panel.classList.add('bottom-full', 'mb-1.5');
+    panel.style.maxHeight = '';
+    if (open) fitSelectPanel(w, panel);
+}
+/* Lista wyboru musi zmieścić się w tym, co ją przycina (np. w oknie modala) – inaczej
+   dolne pozycje są ucięte i nie da się ich kliknąć. Mierzymy najbliższą przewijalną
+   ramkę, a gdy na dole brakuje miejsca – otwieramy listę w górę i skracamy jej wysokość. */
+function fitSelectPanel(w, panel) {
+    let clip = null;
+    for (let el = panel.parentElement; el && el !== document.body; el = el.parentElement) {
+        const oy = getComputedStyle(el).overflowY;
+        if (oy === 'auto' || oy === 'scroll' || oy === 'hidden') { clip = el; break; }
     }
+    const lim = (clip || $('#os')).getBoundingClientRect();
+    const btn = $('[data-select-toggle]', w).getBoundingClientRect();
+    const below = lim.bottom - btn.bottom - 12, above = btn.top - lim.top - 12;
+    const natural = Math.min(panel.scrollHeight || 0, 224);          // ile miejsca chce cała lista
+    const up = below < natural && (above >= natural || above > below);   // woli górę, gdy tam się zmieści
+    panel.classList.toggle('bottom-full', up);
+    panel.classList.toggle('mb-1.5', up);
+    panel.classList.toggle('mt-1.5', !up);
+    panel.style.maxHeight = Math.round(Math.max(96, Math.min(224, up ? above : below))) + 'px';
 }
 function pickSelect(id, value) {
     const cfg = SEL[id]; if (!cfg) return;
@@ -818,7 +837,7 @@ const listPanel = ({ key, title, ic, count, rows, add = '', cls = '' }) => {
 
 /* --- profil pracownika --- */
 function viewProfile(e) {
-    const boss = isBossGrade(e.grade), self = e.ssn === S.me.ssn, manage = canManageGrade(e);
+    const boss = isBossGrade(e.grade), self = sameSsn(e.ssn, S.me.ssn), manage = canManageGrade(e);
     const F = { lic: featOn('licenses'), badge: featOn('badges'), rec: featOn('records') };
     const recs = e.records || [], promos = e.promotions || [];
     const cnt = k => recs.filter(r => r.kind === k && !r.voided).length;      // unieważnione nie wliczają się do statystyk
@@ -870,7 +889,7 @@ function viewProfile(e) {
         ${stat(cnt('commend'), 'Pochwały', 'text-emerald-400')}${stat(cnt('reprimand'), 'Nagany', 'text-brand')}
         ${stat(cnt('plus'), 'Plusy', 'text-emerald-400')}${stat(cnt('minus'), 'Minusy', 'text-brand')}
     </div>` : '';
-    const myVeh = S.vehicles.filter(v => v.assignedTo === e.ssn);
+    const myVeh = S.vehicles.filter(v => sameSsn(v.assignedTo, e.ssn));
     const buttons = `
     <div class="grid grid-cols-2 gap-1.5 shrink-0 content-center">
         ${actBtn('openGradeModal', 'ladder', 'Zmień stopień', manage, manage ? '' : (boss ? 'Stopień szefa nie może być zmieniany' : 'Nie możesz zmieniać własnego stopnia'))}
@@ -1001,7 +1020,7 @@ function openBadgeModal(ssn) {
             <span class="block text-[11px] text-slate-500 mt-1.5">Zostaw puste, aby usunąć numer odznaki.</span></label>`,
         onOk: () => {
             const val = $('#badgeNo').value.trim();
-            const dup = val && S.employees.find(x => x.ssn !== ssn && String(x.badge) === val);
+            const dup = val && S.employees.find(x => !sameSsn(x.ssn, ssn) && String(x.badge) === val);
             if (dup) return toast(`Numer #${val} ma już ${fullName(dup)}`, 'error'), false;
             emp.badge = val ? Number(val) : null;
             post('bossmenu:setBadge', { ssn, badge: emp.badge });
@@ -1403,7 +1422,7 @@ const ORDER_ST = {
     rejected: { label: 'Odrzucone · zwrot środków', ic: 'ban', tone: 'brand' },
     cancelled: { label: 'Anulowane · zwrot środków', ic: 'x', tone: 'slate' }
 };
-const vehCount = ssn => S.vehicles.filter(v => v.assignedTo === ssn).length;
+const vehCount = ssn => S.vehicles.filter(v => sameSsn(v.assignedTo, ssn)).length;
 const inFlight = model => S.orders.filter(o => o.status === 'pending' || o.status === 'accepted').reduce((n, o) => n + ordItems(o).filter(i => i.model === model).length, 0);
 const stChip = (tone, label, ic) => `<span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md border text-[10px] font-bold whitespace-nowrap ${TONES[tone]}">${ic ? icon(ic, 'size-3') : ''}${label}</span>`;
 const gBtn = (act, ic, label, data = '', cls = 'bg-slate-800 text-slate-200 hover:bg-slate-700') =>
@@ -1437,7 +1456,7 @@ const gChips = (act, cur, items) => `<div class="flex flex-wrap gap-1 p-1 rounde
 /* --- zakładka: pojazdy firmy --- */
 function garageVehicles() {
     const q = GAR.search.trim().toLowerCase();
-    const holder = v => v.assignedTo ? S.employees.find(e => e.ssn === v.assignedTo) : null;
+    const holder = v => v.assignedTo ? getEmp(v.assignedTo) : null;
     const list = S.vehicles
         .filter(v => GAR.filter === 'all' || (GAR.filter === 'free' ? !v.assignedTo : !!v.assignedTo))
         .filter(v => { const h = holder(v); return !q || [v.name, v.model, v.plate, v.category, h ? fullName(h) : ''].some(x => String(x || '').toLowerCase().includes(q)); })
@@ -1684,7 +1703,7 @@ function openEmpVehicleModal(ssn) {
         icon: 'car', tone: 'brand', live: true, noOk: true, cancel: 'Zamknij',
         title: 'Pojazdy pracownika', text: fullName(getEmp(ssn)),
         body: () => {
-            const mine = S.vehicles.filter(v => v.assignedTo === ssn), free = S.vehicles.filter(v => !v.assignedTo);
+            const mine = S.vehicles.filter(v => sameSsn(v.assignedTo, ssn)), free = S.vehicles.filter(v => !v.assignedTo);
             if (!free.some(v => v.plate === M.sel)) M.sel = free[0]?.plate ?? null;
             return `<div class="space-y-4">
                 <div>${fieldLabel(`Przydzielone pojazdy (${mine.length})`)}
@@ -1730,7 +1749,7 @@ function openAssignModal(plate) {
     const emps = [...S.employees].sort((a, b) => b.grade - a.grade || fullName(a).localeCompare(fullName(b)));
     if (!emps.length) return toast('Brak pracowników', 'error');
     const cur = v.assignedTo ? getEmp(v.assignedTo) : null;
-    const M = { ssn: (emps.find(e => e.ssn !== v.assignedTo) || emps[0]).ssn, busy: false };
+    const M = { ssn: (emps.find(e => !sameSsn(e.ssn, v.assignedTo)) || emps[0]).ssn, busy: false };
     const o = {
         icon: 'car', tone: 'brand', title: cur ? 'Zmień przydział pojazdu' : 'Przydziel pojazd', text: `${v.name} · ${v.plate}`, ok: cur ? 'Zmień' : 'Przydziel',
         body: () => `<div>${fieldLabel('Pracownik')}${selectHtml({
@@ -1738,7 +1757,7 @@ function openAssignModal(plate) {
             options: emps.map(e => ({ value: e.ssn, label: fullName(e), hint: `${gradeName(e.grade)} · pojazdów: ${vehCount(e.ssn)}` }))
         })}${cur ? `<p class="text-[11px] text-slate-500 mt-2">Obecnie przydzielony: <span class="font-semibold text-slate-300">${esc(fullName(cur))}</span> – straci ten pojazd.</p>` : ''}</div>`,
         onOk: () => {
-            if (M.ssn === v.assignedTo) return toast('Pojazd jest już przydzielony tej osobie', 'error'), false;
+            if (sameSsn(M.ssn, v.assignedTo)) return toast('Pojazd jest już przydzielony tej osobie', 'error'), false;
             const emp = getEmp(M.ssn); if (!emp) return toast('Nie znaleziono pracownika', 'error'), false;
             return modalRequest(o, M, 'bossmenu:assignVehicle', { plate: v.plate, ssn: emp.ssn }, 'Nie udało się przydzielić pojazdu', () => {
                 logVehicle('assign', v, emp, v.assignedTo);
