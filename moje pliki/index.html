@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="pl" class="h-full">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CRP_JOBCORE</title>
+    <!-- ============================================================
+         UWAGA: NIE WOLNO tu ustawiać <meta name="color-scheme" content="dark">
+         ani "color-scheme: dark" na :root. W NUI FiveM (CEF) deklaracja
+         ciemnego schematu kolorów każe silnikowi namalować NIEPRZEZROCZYSTY
+         CZARNY CANVAS na całym ekranie — niezależnie od tego, że html/body są
+         przezroczyste, a interfejs jest ukryty. Objaw: czarny ekran po starcie
+         resource'a, znikający po `stop`. Sprawdzone i potwierdzone:
+         https://github.com/siku-project/siku_radio/pull/7
+         („color-scheme: dark on the root … makes the CEF page paint a black
+          canvas over the game at all times”).
+         Naprawa: color-scheme: normal !important na :root (poniżej).
+         ============================================================ -->
+
+    <!-- ============================================================
+         KRYTYCZNE – MUSI BYĆ W LINII, PRZED CZYMKOLWIEK INNYM
+         NUI w FiveM działa na CEF i maluje własną warstwę zastępczą.
+         Jeżeli html/body nie są JAWNIE przezroczyste, CEF potrafi
+         zamalować CAŁY ekran gry na czarno (czarny ekran po starcie
+         resource'a). Tak samo działa ukrywanie ekranu – bez zależności
+         od klas Tailwinda (gdy CSS się nie wczyta, [hidden] nadal działa).
+         ============================================================ -->
+    <style>
+        :root { color-scheme: normal !important }   /* patrz komentarz wyżej – bez tego CEF maluje czarny canvas */
+        html, body { margin: 0; padding: 0; height: 100%; background: transparent !important; background-color: transparent !important }
+        #screen { background: transparent }
+        #screen[hidden] { display: none !important }
+    </style>
+
+    <!-- Znacznik builda: po starcie w grze wpisz "nui_devtools" i sprawdź w konsoli,
+         czy widzisz ten wpis. BRAK WPISU = gra nadal ładuje stary plik
+         (cache CEF / inna kopia html w resource / zły ui_page). -->
+    <script>
+        document.documentElement.dataset.build = 'nui-fix-3 · 2026-10-01';
+        console.log('[bossmenu] index.html: nui-fix-3 · 2026-10-01 (ta strona jest załadowana jako NUI)');
+    </script>
+
+    <!-- Tailwind skompilowany LOKALNIE (vendor/tailwind.css) – zero CDN.
+         Poprzednio był tu https://cdn.tailwindcss.com: w NUI bywa zablokowany
+         / nieosiągalny, a wtedy nie działało m.in. ukrywanie interfejsu
+         i cała strona zostawała na ekranie gry. -->
+    <link rel="stylesheet" href="vendor/tailwind.css">
+    <link rel="stylesheet" href="vendor/fonts.css">
+</head>
+<body>
+    <!-- Cały interfejs (style, pulpit, okna, pasek zadań) jest generowany w bossmenu.js -->
+    <script src="bossmenu.js"></script>
+</body>
+</html>
