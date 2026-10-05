@@ -1,7 +1,11 @@
-local ESX = exports["es_extended"]:getSharedObject()
-local ui = require('modules.ui.c_ui')
+--[[
+    c_bossmenu.lua – wejście klienta (spina moduły)
 
-RegisterCommand('testbossmenu', function()
-    local bossmenuData = lib.callback.await('crp_jobcore:bossmenu:server:getBossmenuData', false)
-    local closed = ui.openUI('open', {})
-end, false)
+    c_main.lua – punkty, animacja krzesła, panel NUI
+
+    Komenda: Config.Command (domyślnie /bossmenu) – działa też bez siadania na krześle.
+]]
+
+require('resources.bossmenu.c_main')
+
+return {}
