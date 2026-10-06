@@ -88,6 +88,7 @@ Config.Society = function(job) return 'society_' .. job end
 -- ─────────────────────────────────────────────────────────────
 Config.Jobs = {
     police = {
+        minGrade = 0,
         salaryMax = 180,
         features  = { licenses = true, badges = true, records = true },   -- co pokazać w panelu
         supplier  = false,                                                -- true = firma może publikować ofertę dla innych firm
@@ -113,11 +114,12 @@ Config.Jobs = {
         }
     },
 
-    cardealer = {
+    centra_autos = {
+        minGrade = 0,
         salaryMax = 200,
         features  = { licenses = false, badges = false, records = true },
         supplier  = true,
-        supplierDesc = 'Akcesoria i dokumenty dla właścicieli pojazdów.',
+        supplierDesc = 'Salon samochodowy – dostarcza pojazdy innym firmom.',
         licenses  = {}
     }
 }
@@ -128,6 +130,13 @@ Config.Jobs = {
 -- ─────────────────────────────────────────────────────────────
 Config.Locations = {
     ['mrpd'] = {
+        job            = 'centra_autos',
+        mcoords        = vec4(461.4712, -987.8772, 31.2, 0.4353),      -- środek punktu
+        distance       = 20.0,                                         -- z jakiej odległości punkt się aktywuje
+        bossmenucoords = vec4(461.5347, -986.2550, 30.6604, 180.0223), -- strefa ox_target „Otwórz Boss Menu”
+        chaircoords    = vec4(461.7296, -985.3137, 30.4, 305.0)        -- gdzie spawnuje się krzesło
+    },
+    ['mrpd1'] = {
         job            = 'police',
         mcoords        = vec4(461.4712, -987.8772, 31.2, 0.4353),      -- środek punktu
         distance       = 20.0,                                         -- z jakiej odległości punkt się aktywuje
@@ -150,8 +159,12 @@ Config.Locations = {
 --  Zamówienie trafia do firmy-dostawcy, która musi je przyjąć i dostarczyć.
 -- ─────────────────────────────────────────────────────────────
 Config.VehicleShop = {
-    supplierJob = 'cardealer',
-    expressFee  = 3000,       -- dopłata za szybki transport (za pojazd); można nadpisać per pojazd
+    supplierJob = 'centra_autos',
+    expressFee  = 3000,       -- domyślna dopłata za szybki transport; firma może ustawić własną per pojazd
+
+    -- Katalogiem pojazdów zarządza firma-dostawca w panelu (zakładka Oferta):
+    -- dodaje pojazdy (model + nazwa + cena), ustawia widoczność i dopłatę za szybki transport.
+    -- Uwaga: `supplierJob` musi być pracą, która naprawdę istnieje w ESX (tu: centra_autos).
     cartMax     = 10,         -- maks. pozycji w koszyku
     plateFormat = 'AAA 000',  -- A = litera, 0 = cyfra (max 8 znaków w ESX)
     ownedVehicles = {
@@ -160,19 +173,12 @@ Config.VehicleShop = {
         -- właściciel wpisu w owned_vehicles: pracownik, któremu przydzielono auto, albo konto firmy
         owner   = function(job, identifier) return identifier or ('society:' .. job) end
     },
-    catalog = {
-        { model = 'flatbed',      name = 'MTL Flatbed',         category = 'Pojazdy serwisowe', price = 42000 },
-        { model = 'towtruck',     name = 'Vapid Tow Truck',     category = 'Pojazdy serwisowe', price = 38000 },
-        { model = 'utillitruck3', name = 'Utility Truck',       category = 'Pojazdy serwisowe', price = 26000 },
-        { model = 'speedo',       name = 'Vapid Speedo',        category = 'Dostawcze',         price = 21000 },
-        { model = 'burrito3',     name = 'Declasse Burrito',    category = 'Dostawcze',         price = 19000 },
-        { model = 'bison',        name = 'Bravado Bison',       category = 'Pickupy',           price = 31000 },
-        { model = 'sadler',       name = 'Vapid Sadler',        category = 'Pickupy',           price = 17000 },
-        { model = 'sandking',     name = 'Vapid Sandking',      category = 'Terenowe',          price = 54000 },
-        { model = 'caracara2',    name = 'Vapid Caracara 4x4',  category = 'Terenowe',          price = 72000, expressFee = 6500 },
-        { model = 'schafter2',    name = 'Benefactor Schafter', category = 'Osobowe',           price = 28000 },
-        { model = 'buffalo',      name = 'Bravado Buffalo',     category = 'Osobowe',           price = 195000 }
-    }
+    seedCatalog = false,      -- jednorazowe przeniesienie listy niżej do oferty dostawcy; false = katalog robisz sam w panelu
+
+    -- Lista poniżej to gotowa podpowiedź (modele z GTA). Przy seedCatalog = false NIE jest nigdzie
+    -- przenoszona – wpisujesz pojazdy w panelu (Oferta → Dodaj produkt). Włącz seedCatalog = true
+    -- tylko wtedy, gdy chcesz je jednorazowo wgrać do oferty salonu.
+    catalog = false
 }
 
 -- ─────────────────────────────────────────────────────────────

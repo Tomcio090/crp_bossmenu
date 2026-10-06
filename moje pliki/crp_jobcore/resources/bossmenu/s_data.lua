@@ -283,7 +283,9 @@ local TABLES_DEF = {
             'descr VARCHAR(300) NULL',
             'price BIGINT NOT NULL',
             'active TINYINT(1) NOT NULL DEFAULT 1',
-            'access LONGTEXT NULL'
+            'access LONGTEXT NULL',
+            'model VARCHAR(50) NULL',      -- pojazd: nazwa modelu do spawnu (puste = zwykły towar)
+            'express_fee INT NULL'         -- dopłata za szybki transport za sztukę (puste = domyślna z konfiguracji)
         },
         keys = { 'INDEX idx_job (job)' }
     }
@@ -514,6 +516,7 @@ function data.Install()
         for _, sql in ipairs(SCHEMA) do MySQL.query.await(sql) end
     end)
     step('dokładanie brakujących kolumn', data.AlignSchema)
+    step('katalog pojazdów → oferta dostawcy', data.SeedCatalog)
     step('wyrównanie kolacji', data.AlignCollation)
     step('sprawdzanie definicji licencji', data.CheckLicenseDefinitions)
 
@@ -1212,11 +1215,12 @@ function data.Products(job)
     local list = products[job]
     if not list then
         list = {}
-        local rows = MySQL.query.await('SELECT id, name, category, descr, price, active, access FROM ' .. T('products') .. ' WHERE job = ? ORDER BY id', { job })
+        local rows = MySQL.query.await('SELECT id, name, category, descr, price, active, access, model, express_fee FROM ' .. T('products') .. ' WHERE job = ? ORDER BY id', { job })
         for _, p in ipairs(rows or {}) do
             list[#list + 1] = {
                 id = p.id, name = p.name, category = p.category or '', desc = p.descr or '',
-                price = p.price, active = p.active == 1, access = p.access and json.decode(p.access) or nil
+                price = p.price, active = p.active == 1, access = p.access and json.decode(p.access) or nil,
+                model = p.model, expressFee = p.express_fee
             }
         end
         products[job] = list
@@ -1225,6 +1229,59 @@ function data.Products(job)
 end
 
 function data.InvalidateProducts(job) products[job] = nil end
+
+-- ── KATALOG POJAZDÓW ─────────────────────────────────────────────────────────
+-- Katalogiem jest oferta firmy-dostawcy pojazdów (Config.VehicleShop.supplierJob).
+-- Pozycja trafia do katalogu, gdy ma wpisany model pojazdu, jest widoczna (active)
+-- i firma zamawiająca ma do niej dostęp (access). Cenę i dopłatę za szybki transport
+-- ustawia dostawca w panelu (zakładka Oferta).
+function data.VehicleCatalog(job)
+    local out = {}
+    local vs = Config.VehicleShop
+    local supplierJob = vs and vs.supplierJob
+    if not supplierJob or not Config.Jobs[supplierJob] then return out end
+
+    for _, p in ipairs(data.Products(supplierJob)) do
+        if p.model and p.model ~= '' and p.active and data.HasAccess(p, job) then
+            out[#out + 1] = {
+                model = p.model, name = p.name, category = p.category or '',
+                price = p.price, expressFee = p.expressFee
+            }
+        end
+    end
+    return out
+end
+
+-- Katalog z Config.VehicleShop.catalog (jeśli go zostawisz) trafia do oferty dostawcy TYLKO raz –
+-- od tej pory pojazdami zarządza firma w panelu. Wyłączyć: Config.VehicleShop.seedCatalog = false.
+function data.SeedCatalog()
+    local vs = Config.VehicleShop
+    local list = vs and vs.catalog
+    if not vs or vs.seedCatalog == false or type(list) ~= 'table' or #list == 0 then return 0 end
+
+    local supplierJob = vs.supplierJob
+    if not Config.Jobs[supplierJob] then return 0 end
+
+    for _, p in ipairs(data.Products(supplierJob)) do
+        if p.model and p.model ~= '' then return 0 end      -- dostawca ma już swoje pojazdy – nie dopisujemy
+    end
+
+    local added = 0
+    for _, v in ipairs(list) do
+        if v.model and v.name and not data.ProductNameExists(supplierJob, v.name) then
+            data.SaveProduct(supplierJob, nil, {
+                name = v.name, category = v.category or '', desc = v.desc or '',
+                price = v.price, active = true, model = v.model, expressFee = v.expressFee
+            })
+            added = added + 1
+        end
+    end
+    if added > 0 then
+        print(('^2[crp_bossmenu]^7 katalog z konfiguracji przeniesiony do oferty %s (%d %s) – dalej zarządza nim firma w panelu')
+            :format(supplierJob, added, added == 1 and 'pozycja' or 'pozycji'))
+    end
+    return added
+end
 
 function data.FindProduct(job, id)
     return MySQL.single.await('SELECT id, name, price, active, access FROM ' .. T('products') .. ' WHERE id = ? AND job = ?', { id, job })
@@ -1237,12 +1294,15 @@ end
 
 function data.SaveProduct(job, id, p)
     local access = p.access and json.encode(p.access) or nil
+    local model = (p.model and p.model ~= '') and p.model or nil
+    local expressFee = p.expressFee            -- nil = domyślna dopłata z Config.VehicleShop.expressFee
+
     if id then
-        MySQL.update.await('UPDATE ' .. T('products') .. ' SET name = ?, category = ?, descr = ?, price = ?, active = ?, access = ? WHERE id = ? AND job = ?',
-            { p.name, p.category, p.desc, p.price, p.active and 1 or 0, access, id, job })
+        MySQL.update.await('UPDATE ' .. T('products') .. ' SET name = ?, category = ?, descr = ?, price = ?, active = ?, access = ?, model = ?, express_fee = ? WHERE id = ? AND job = ?',
+            { p.name, p.category, p.desc, p.price, p.active and 1 or 0, access, model, expressFee, id, job })
     else
-        id = MySQL.insert.await('INSERT INTO ' .. T('products') .. ' (job, name, category, descr, price, active, access) VALUES (?, ?, ?, ?, ?, ?, ?)',
-            { job, p.name, p.category, p.desc, p.price, p.active and 1 or 0, access })
+        id = MySQL.insert.await('INSERT INTO ' .. T('products') .. ' (job, name, category, descr, price, active, access, model, express_fee) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            { job, p.name, p.category, p.desc, p.price, p.active and 1 or 0, access, model, expressFee })
     end
     data.InvalidateProducts(job)
     return id
@@ -1525,11 +1585,8 @@ function data.Build(s)
         }
     end
 
-    -- ── katalog pojazdów ──
-    local catalog = {}
-    for _, v in ipairs(Config.VehicleShop.catalog) do
-        catalog[#catalog + 1] = { model = v.model, name = v.name, category = v.category, price = v.price, expressFee = v.expressFee }
-    end
+    -- ── katalog pojazdów (oferta firmy-dostawcy: widoczność, ceny i dopłaty ustawiane w panelu) ──
+    local catalog = data.VehicleCatalog(job)
 
     local ownProducts
     if jc.supplier then
@@ -1551,7 +1608,8 @@ function data.Build(s)
         transactions = transactions,
         history     = history,
         supplier    = job ~= Config.VehicleShop.supplierJob and data.JobLabel(Config.VehicleShop.supplierJob) or '',
-        expressFee  = Config.VehicleShop.expressFee,
+        expressFee  = Config.VehicleShop.expressFee,      -- domyślna dopłata, gdy produkt nie ma własnej
+        vehicleSupplier = job == Config.VehicleShop.supplierJob,
         catalog     = catalog,
         vehicles    = vehicles,
         orders      = vehicleOrders,

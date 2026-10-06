@@ -614,7 +614,7 @@ H.orderVehicles = function(c, d)
     if type(d.items) ~= 'table' or #d.items < 1 or #d.items > vs.cartMax then return err('Nieprawidłowa liczba pojazdów') end
 
     local catalog = {}
-    for _, v in ipairs(vs.catalog) do catalog[v.model] = v end
+    for _, v in ipairs(data.VehicleCatalog(c.job)) do catalog[v.model] = v end
 
     local items, names, total, express = {}, {}, 0, 0
     for _, picked in ipairs(d.items) do
@@ -802,6 +802,18 @@ H.saveProduct = function(c, d)
     local desc = str(d.desc or '', 200); if not desc then return err('Opis jest za długi (max 200)') end
     local price = int(d.price, 1, G.maxPrice); if not price then return err(('Cena: 1–%d'):format(G.maxPrice)) end
 
+    -- pojazd (tylko firma-dostawca): model do spawnu + własna dopłata za szybki transport
+    local model = str(d.model or '', 50)
+    if not model then return err('Model pojazdu jest za długi (max 50 znaków)') end
+    if model ~= '' and not model:match('^[%w_%-]+$') then return err('Model pojazdu: tylko litery, cyfry, - i _') end
+    model = model ~= '' and model or nil
+
+    local expressFee
+    if d.expressFee ~= nil and d.expressFee ~= '' and d.expressFee ~= json.null then
+        expressFee = int(d.expressFee, 0, G.maxPrice)
+        if not expressFee then return err(('Dopłata za szybki transport: 0–%d'):format(G.maxPrice)) end
+    end
+
     local access
     if d.access ~= nil and d.access ~= json.null and type(d.access) == 'table' then
         access = {}
@@ -821,7 +833,8 @@ H.saveProduct = function(c, d)
     end
     if data.ProductNameExists(c.job, name, id) then return err('Produkt o tej nazwie już istnieje w ofercie') end
 
-    local product = { name = name, category = category, desc = desc, price = price, active = d.active ~= false, access = access }
+    local product = { name = name, category = category, desc = desc, price = price, active = d.active ~= false,
+                      access = access, model = model, expressFee = expressFee }
     id = data.SaveProduct(c.job, previous and id or nil, product)
 
     if not previous then

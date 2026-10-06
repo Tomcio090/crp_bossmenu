@@ -371,6 +371,7 @@ const MOCK = {
         { type: 'in', amount: 3900, by: 'System', label: 'Faktury klientów', at: '25.09 21:15' }
     ],
     supplier: 'Premium Deluxe Motorsport',
+    vehicleSupplier: true,                  // DEMO: w grze ustawia to Lua – true tylko dla firmy-dostawcy pojazdów
     expressFee: 3000,                       // dopłata za szybki transport (za pojazd); pojazd w katalogu może mieć własne expressFee
     catalog: [
         { model: 'flatbed', name: 'MTL Flatbed', category: 'Pojazdy serwisowe', price: 42000 },
@@ -433,7 +434,8 @@ const MOCK = {
             { id: 'o-clean', name: 'Zestaw czyszczący', category: 'Kosmetyka', price: 180, desc: 'Szampon, wosk i mikrofibry.', active: true },
             { id: 'o-tyres', name: 'Opony wyczynowe – komplet', category: 'Części', price: 2400, active: true, access: ['ems'] },
             { id: 'o-oil', name: 'Olej silnikowy 5L', category: 'Płyny', price: 140, active: true },
-            { id: 'o-battery', name: 'Akumulator', category: 'Części', price: 520, desc: 'Chwilowo niedostępny.', active: false }
+            { id: 'o-battery', name: 'Akumulator', category: 'Części', price: 520, desc: 'Chwilowo niedostępny.', active: false },
+            { id: 'o-car', name: 'Vapid Caracara 4x4', category: 'Pojazdy', price: 72000, desc: 'Terenowy pickup z salonu.', active: true, model: 'caracara2', expressFee: 6500 }
         ] },
         out: [
             { id: 'zam-3004', kind: 'goods', supplier: { job: 'wholesale', label: 'Hurtownia Los Santos' }, buyer: { job: 'mechanic', label: 'Warsztat Samochodowy' }, by: 'Kamil Wiśniewski', at: '01.10.2026 09:12', status: 'pending', note: 'Prosimy o dostawę do 18:00', total: 3650,
@@ -2062,7 +2064,7 @@ function shopOffer() {
             <div class="size-9 shrink-0 rounded-lg border flex items-center justify-center ${on ? TONES.emerald : TONES.slate}">${icon('box', 'size-5')}</div>
             <div class="flex-1 min-w-0">
                 <div class="flex items-center gap-2 min-w-0"><p class="text-xs font-bold truncate ${on ? 'text-white' : 'text-slate-500'}">${esc(p.name)}</p>
-                    ${p.category ? stChip('slate', esc(p.category)) : ''}${on ? '' : stChip('amber', 'Ukryty', 'eye')}${accChip(p)}</div>
+                    ${p.category ? stChip('slate', esc(p.category)) : ''}${p.model ? stChip('sky', esc(p.model), 'car') : ''}${Number(p.expressFee) > 0 ? stChip('amber', '⚡ +' + money(p.expressFee), 'bolt') : ''}${on ? '' : stChip('amber', 'Ukryty', 'eye')}${accChip(p)}</div>
                 <p class="text-[10px] text-slate-500 truncate">${esc(p.desc || 'Brak opisu')}</p>
             </div>
             <span class="shrink-0 w-[96px] text-right text-xs font-extrabold ${on ? 'text-white' : 'text-slate-500'}">${money(p.price)}<span class="text-[10px] font-semibold text-slate-500"> / szt.</span></span>
@@ -2076,7 +2078,7 @@ function shopOffer() {
     return `
     <div class="shrink-0 flex items-start gap-2.5 px-3.5 py-2.5 rounded-xl bg-sky-500/5 border border-sky-500/20 text-[11px] leading-4 text-slate-300">
         <span class="text-sky-400 shrink-0 mt-px">${icon('info-circle', 'size-4')}</span>
-        <p>Domyślnie produkty widzą wszystkie firmy w zakładce „Zamów” – w edycji produktu możesz ograniczyć dostęp do wybranych firm. Ukryty produkt zostaje w ofercie, ale nie można go zamówić. Zmiana ceny nie wpływa na złożone już zamówienia.</p>
+        <p>Domyślnie produkty widzą wszystkie firmy w zakładce „Zamów” – w edycji produktu możesz ograniczyć dostęp do wybranych firm. Ukryty produkt zostaje w ofercie, ale nie można go zamówić. Zmiana ceny nie wpływa na złożone już zamówienia.${S.vehicleSupplier ? ' Twoje pozycje z modelem pojazdu tworzą katalog w Garażu – tam ustawiasz też dopłatę za szybki transport.' : ''}</p>
     </div>
     <div class="shrink-0 flex gap-3">${gSearch('offSearch', SHOP.offQ, 'Szukaj w swojej ofercie…')}</div>
     ${listPanel({ key: 'offer', title: 'Moja oferta', ic: 'building-store', count: list.length, rows: list.map(row), add: gBtn('offAdd', 'plus', 'Dodaj produkt', '', 'text-white bg-brand hover:opacity-90'), cls: 'flex-1' })}`;
@@ -2232,6 +2234,7 @@ function syncAccessUI() {
 function openProductModal(id) {
     const of = shop().offer; if (!of) return;
     const p = id ? of.products.find(x => sameId(x.id, id)) : null; if (id && !p) return;
+    const isVeh = S.vehicleSupplier === true;      // firma-dostawca pojazdów → jej oferta tworzy katalog w Garażu
     const cos = shop().companies, M = PROD_M = { busy: false, mode: Array.isArray(p?.access) ? 'some' : 'all', sel: new Set(Array.isArray(p?.access) ? p.access : []) };
     const inp = (idAttr, label, val, ph, extra = '') => `<label class="block">${fieldLabel(label)}<input id="${idAttr}" value="${esc(val)}" placeholder="${ph}" autocomplete="off" ${extra}
         class="w-full bg-slate-950/60 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm font-bold text-white placeholder-slate-500 focus:border-brand/50 outline-none"></label>`;
@@ -2247,6 +2250,13 @@ function openProductModal(id) {
             </div>
             <label class="block">${fieldLabel('Opis (opcjonalnie)')}<textarea id="prodDesc" rows="2" maxlength="120" placeholder="Krótki opis widoczny dla zamawiających…"
                 class="w-full resize-none bg-slate-950/60 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-white placeholder-slate-500 focus:border-brand/50 outline-none">${esc(p?.desc || '')}</textarea></label>
+            ${isVeh ? `<div class="grid grid-cols-2 gap-3">
+                ${inp('prodModel', 'Model pojazdu (spawn)', p?.model || '', 'np. caracara2', 'maxlength="50"')}
+                <label class="block">${fieldLabel('Szybki transport (za sztukę)')}<div class="relative"><span class="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-500 text-sm font-bold">$</span>
+                    <input id="prodFee" inputmode="numeric" maxlength="7" value="${esc(p?.expressFee ?? '')}" placeholder="${esc(String(S.expressFee ?? 0))}" autocomplete="off"
+                    class="w-full bg-slate-950/60 border border-slate-800 rounded-xl pl-7 pr-3 py-2.5 text-sm font-bold text-white placeholder-slate-500 focus:border-brand/50 outline-none"></div></label>
+            </div>
+            <p class="text-[11px] text-slate-500">Pozycje z wpisanym modelem trafiają do katalogu w Garażu – inne firmy zamawiają je jak pojazdy. Puste pole dopłaty = kwota domyślna (${money(S.expressFee || 0)}).</p>` : ''}
             <label class="flex items-center gap-3 cursor-pointer select-none">
                 <input id="prodActive" type="checkbox" class="peer sr-only" ${!p || p.active !== false ? 'checked' : ''}>
                 <span class="relative w-11 h-6 rounded-full bg-slate-700 transition peer-checked:bg-brand after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:size-5 after:rounded-full after:bg-white after:shadow after:transition-transform peer-checked:after:translate-x-5"></span>
@@ -2269,12 +2279,19 @@ function openProductModal(id) {
             const name = $('#prodName').value.trim(), category = $('#prodCat').value.trim(), desc = $('#prodDesc').value.trim(), price = parseInt($('#prodPrice').value, 10), active = $('#prodActive').checked;
             if (name.length < 2) return toast('Podaj nazwę produktu (min. 2 znaki)', 'error'), false;
             if (!price || price < 1 || price > PRODUCT_MAX) return toast(`Cena musi być z zakresu $1 – ${money(PRODUCT_MAX)}`, 'error'), false;
+            const model = isVeh ? ($('#prodModel')?.value || '').trim() : '';
+            if (model && !/^[A-Za-z0-9_-]{1,50}$/.test(model)) return toast('Model pojazdu: tylko litery, cyfry, - i _ (max 50 znaków)', 'error'), false;
+            const feeRaw = isVeh ? ($('#prodFee')?.value || '').trim() : '';
+            const expressFee = feeRaw === '' ? null : parseInt(feeRaw, 10);
+            if (isVeh && feeRaw !== '' && (!Number.isFinite(expressFee) || expressFee < 0 || expressFee > PRODUCT_MAX))
+                return toast(`Dopłata za szybki transport: $0 – ${money(PRODUCT_MAX)}`, 'error'), false;
             const access = M.mode === 'some' ? [...M.sel] : null;
             if (access && !access.length) return toast('Wybierz co najmniej jedną firmę albo zezwól wszystkim', 'error'), false;
             if (of.products.some(x => x !== p && x.name.toLowerCase() === name.toLowerCase())) return toast('Produkt o takiej nazwie już istnieje w ofercie', 'error'), false;
-            return modalRequest(o, M, 'bossmenu:saveProduct', { ...(p ? { id: p.id } : {}), name, category, desc, price, active, access }, 'Nie udało się zapisać produktu', res => {
+            return modalRequest(o, M, 'bossmenu:saveProduct', { ...(p ? { id: p.id } : {}), name, category, desc, price, active, access,
+                model: model || null, expressFee }, 'Nie udało się zapisać produktu', res => {
                 const from = p?.price, wasActive = p ? p.active !== false : true, accChanged = p && JSON.stringify(p.access ?? null) !== JSON.stringify(access);
-                const saved = { id: p?.id ?? 'p' + Date.now(), name, category, desc, price, active, access, ...res.product };
+                const saved = { id: p?.id ?? 'p' + Date.now(), name, category, desc, price, active, access, model: model || null, expressFee, ...res.product };
                 if (p) Object.assign(p, saved); else of.products.push(saved);
                 addHistory(!p ? { type: 'offerChange', action: 'add', name, to: price }
                     : from !== price ? { type: 'offerChange', action: 'price', name, from, to: price }
@@ -2291,7 +2308,8 @@ function offerToggle(id) {
     const of = shop().offer, p = of?.products.find(x => sameId(x.id, id)); if (!p || SHOP.busy) return;
     const active = p.active === false;
     SHOP.busy = true;
-    request('bossmenu:saveProduct', { id: p.id, name: p.name, category: p.category || '', desc: p.desc || '', price: p.price, active, access: Array.isArray(p.access) ? p.access : null }).then(res => {
+    request('bossmenu:saveProduct', { id: p.id, name: p.name, category: p.category || '', desc: p.desc || '', price: p.price, active,
+        access: Array.isArray(p.access) ? p.access : null, model: p.model ?? null, expressFee: p.expressFee ?? null }).then(res => {
         SHOP.busy = false;
         if (!res?.ok) return toast(res?.error || 'Nie udało się zmienić produktu', 'error');
         p.active = active;
