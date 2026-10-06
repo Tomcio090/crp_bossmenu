@@ -127,6 +127,9 @@ const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const money = n => (n < 0 ? '-$' : '$') + Math.abs(Number(n)).toLocaleString('en-US').replace(/,/g, ' ');
+// Duże kwoty nie mogą się ucinać: dobieramy wielkość czcionki do długości tekstu (np. saldo 100 000 000).
+const moneyFs = (v, base = 26, mid = 20, small = 15) => { const L = String(v).length; return L > 15 ? small - 2 : L > 12 ? small : L > 9 ? mid : base; };
+const valFs = v => { const L = String(v).length; return L > 18 ? 10 : L > 14 ? 11 : L > 11 ? 12 : 14; };
 const initials = n => n.split(' ').map(p => p[0]).join('').slice(0, 2).toUpperCase();
 const fullName = p => p.name || `${p.firstname} ${p.lastname}`;
 const pad = n => String(n).padStart(2, '0');
@@ -157,6 +160,7 @@ const TONES = {
     sky: 'text-sky-400 bg-sky-500/10 border-sky-500/30',
     amber: 'text-amber-400 bg-amber-500/10 border-amber-500/30',
     emerald: 'text-emerald-400 bg-emerald-500/10 border-emerald-500/30',
+    violet: 'text-violet-300 bg-violet-500/10 border-violet-500/30',
     slate: 'text-slate-300 bg-slate-500/10 border-slate-500/30'
 };
 
@@ -201,10 +205,13 @@ const NUI_URL = /^nui:/i.test(location.protocol) || /cfx-nui-/i.test(location.ho
 let IN_GAME = typeof GetParentResourceName === 'function' || NUI_URL;
 let DEV_ON = false;
 const BASE = (document.currentScript?.src || location.href).replace(/[?#].*$/, '').replace(/[^/]*$/, '');   // katalog bossmenu.js – stąd ładujemy vendor/
+/* `model: null` / `expressFee: null` w ogóle nie lecą do Lua – w transporcie NUI `null` i brak klucza
+   to dla msgpacka to samo, a dzięki temu nie trzeba pamiętać o porównaniach z `json.null` po stronie serwera. */
+const stripNulls = data => Object.fromEntries(Object.entries(data || {}).filter(([, v]) => v !== null && v !== undefined));
 const nui = (event, data) => fetch(`https://${GetParentResourceName()}/${event}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json; charset=UTF-8' },
-    body: JSON.stringify(data)
+    body: JSON.stringify(stripNulls(data))
 }).then(r => r.json()).catch(() => null);
 let OPEN_ACTION = 'bossmenu';   // nazwa akcji, którą Lua otworzyło UI (ui.openUI(action, data)) – wraca w `close`
 let DID_CHANGE = true;         // czy w tej sesji wykonano jakąkolwiek akcję (idzie jako `success` w `close`)
@@ -227,7 +234,7 @@ let S = {
     me: { ssn: '', firstname: '—', lastname: '', grade: 0 },
     features: { licenses: false, badges: false, records: false },   // włączane przez serwer
     licenseDefs: [],
-    grades: [], employees: [], funds: 0, transactions: [], history: [],
+    grades: [], employees: [], funds: 0, maxPrice: 0, related: [], transactions: [], history: [],
     catalog: [], vehicles: [], orders: [], supplier: '',      // garaż
     shop: { suppliers: [], offer: null, out: [], incoming: [] },   // zamówienia B2B (towary)
     salaryMax: null,                                         // limit stawki za godzinę (null = brak limitu w UI)
@@ -242,8 +249,9 @@ function normalizeState(s) {
     if (typeof s.job.name !== 'string' || !s.job.name) s.job.name = 'job';
     if (!s.me || typeof s.me !== 'object') s.me = { ssn: '', firstname: '—', lastname: '', grade: 0 };
     if (!s.features || typeof s.features !== 'object') s.features = {};
-    ['licenseDefs', 'grades', 'employees', 'transactions', 'history', 'catalog', 'vehicles', 'orders'].forEach(k => { if (!Array.isArray(s[k])) s[k] = []; });
+    ['licenseDefs', 'grades', 'employees', 'transactions', 'history', 'catalog', 'vehicles', 'orders', 'related'].forEach(k => { if (!Array.isArray(s[k])) s[k] = []; });
     s.funds = Number(s.funds) || 0;
+    s.maxPrice = Number(s.maxPrice) || 0;
     if (!s.webhooks || typeof s.webhooks !== 'object') s.webhooks = { plusminus: '', commend: '', promo: '' };
     if (!s.shop || typeof s.shop !== 'object') s.shop = { suppliers: [], offer: null, out: [], incoming: [] };
     else {
@@ -373,6 +381,7 @@ const MOCK = {
     supplier: 'Premium Deluxe Motorsport',
     vehicleSupplier: true,                  // DEMO: w grze ustawia to Lua – true tylko dla firmy-dostawcy pojazdów
     expressFee: 3000,                       // dopłata za szybki transport (za pojazd); pojazd w katalogu może mieć własne expressFee
+    goodsExpressFee: 0,                     // domyślna dopłata za szybki transport towarów (0 = tylko to, co ustawi dostawca na produkcie)
     catalog: [
         { model: 'flatbed', name: 'MTL Flatbed', category: 'Pojazdy serwisowe', price: 42000 },
         { model: 'towtruck', name: 'Vapid Tow Truck', category: 'Pojazdy serwisowe', price: 38000 },
@@ -410,17 +419,17 @@ const MOCK = {
                 { id: 'toolbox', name: 'Skrzynka narzędziowa', category: 'Narzędzia', price: 450, desc: 'Komplet kluczy i narzędzi ręcznych.', active: true },
                 { id: 'repairkit', name: 'Zestaw naprawczy', category: 'Narzędzia', price: 320, desc: 'Szybka naprawa pojazdu w terenie.', active: true },
                 { id: 'tyres', name: 'Opony – komplet', category: 'Części', price: 1200, desc: 'Cztery opony letnie.', active: true },
-                { id: 'fuelcan', name: 'Kanister paliwa', category: 'Materiały', price: 90, active: true },
+                { id: 'fuelcan', name: 'Kanister paliwa', category: 'Materiały', price: 90, active: true, expressFee: 40 },
                 { id: 'paint', name: 'Puszka farby', category: 'Materiały', price: 60, desc: 'Farba samochodowa, różne kolory.', active: true, access: ['police', 'taxi'] },
                 { id: 'parts', name: 'Paczka części zamiennych', category: 'Części', price: 800, active: true }
             ] },
             { job: 'cardealer', label: 'Premium Deluxe Motorsport', desc: 'Akcesoria i dokumenty dla właścicieli pojazdów.', products: [
-                { id: 'plates', name: 'Pakiet tablic rejestracyjnych', category: 'Dokumenty', price: 2500, desc: '10 kompletów tablic.', active: true },
+                { id: 'plates', name: 'Pakiet tablic rejestracyjnych', category: 'Dokumenty', price: 2500, desc: '10 kompletów tablic.', active: true, expressFee: 150 },
                 { id: 'keys', name: 'Zestaw kluczyków', category: 'Akcesoria', price: 800, active: true },
                 { id: 'wax', name: 'Środek do pielęgnacji lakieru', category: 'Akcesoria', price: 350, active: true }
             ] },
             { job: 'gastro', label: 'Bean Machine Coffee', desc: 'Zaopatrzenie dla firm: kawa, przekąski i napoje.', products: [
-                { id: 'coffee', name: 'Kawa – karton', category: 'Napoje', price: 120, active: true },
+                { id: 'coffee', name: 'Kawa – karton', category: 'Napoje', price: 120, active: true, expressFee: 60 },
                 { id: 'energy', name: 'Napoje energetyczne – zgrzewka', category: 'Napoje', price: 180, active: true },
                 { id: 'sandwich', name: 'Kanapki – zestaw', category: 'Przekąski', price: 240, active: true }
             ] }
@@ -438,8 +447,8 @@ const MOCK = {
             { id: 'o-car', name: 'Vapid Caracara 4x4', category: 'Pojazdy', price: 72000, desc: 'Terenowy pickup z salonu.', active: true, model: 'caracara2', expressFee: 6500 }
         ] },
         out: [
-            { id: 'zam-3004', kind: 'goods', supplier: { job: 'wholesale', label: 'Hurtownia Los Santos' }, buyer: { job: 'mechanic', label: 'Warsztat Samochodowy' }, by: 'Kamil Wiśniewski', at: '01.10.2026 09:12', status: 'pending', note: 'Prosimy o dostawę do 18:00', total: 3650,
-              items: [{ id: 'repairkit', name: 'Zestaw naprawczy', price: 320, qty: 10 }, { id: 'fuelcan', name: 'Kanister paliwa', price: 90, qty: 5 }] },
+            { id: 'zam-3004', kind: 'goods', supplier: { job: 'wholesale', label: 'Hurtownia Los Santos' }, buyer: { job: 'mechanic', label: 'Warsztat Samochodowy' }, by: 'Kamil Wiśniewski', at: '01.10.2026 09:12', status: 'pending', note: 'Prosimy o dostawę do 18:00', total: 3850,
+              items: [{ id: 'repairkit', name: 'Zestaw naprawczy', price: 320, qty: 10 }, { id: 'fuelcan', name: 'Kanister paliwa', price: 90, qty: 5, express: true, fee: 40 }] },
             { id: 'zam-3003', kind: 'goods', supplier: { job: 'gastro', label: 'Bean Machine Coffee' }, buyer: { job: 'mechanic', label: 'Warsztat Samochodowy' }, by: 'Natalia Mazur', at: '30.09.2026 16:30', status: 'accepted', total: 840,
               items: [{ id: 'coffee', name: 'Kawa – karton', price: 120, qty: 3 }, { id: 'sandwich', name: 'Kanapki – zestaw', price: 240, qty: 2 }] },
             { id: 'zam-3002', kind: 'goods', supplier: { job: 'wholesale', label: 'Hurtownia Los Santos' }, buyer: { job: 'mechanic', label: 'Warsztat Samochodowy' }, by: 'Adam Nowak', at: '27.09.2026 11:05', status: 'delivered', total: 900,
@@ -513,10 +522,11 @@ function devReply(event, data) {
             const pr = (sp.products || []).find(x => sameId(x.id, it.id) && canBuy(x));
             if (!pr) return { ok: false, error: 'Produkt nie jest już dostępny w ofercie' };
             if (!(it.qty >= 1 && it.qty <= QTY_MAX)) return { ok: false, error: 'Nieprawidłowa ilość' };
-            items.push({ id: pr.id, name: pr.name, price: pr.price, qty: it.qty });
+            const fee = goodsFee(pr), fast = it.express === true && fee > 0;
+            items.push({ id: pr.id, name: pr.name, price: pr.price, qty: it.qty, express: fast, fee: fast ? fee : 0 });
         }
         if (!items.length || items.length > SHOP_LINES) return { ok: false, error: 'Nieprawidłowa liczba pozycji' };
-        const total = items.reduce((n, i) => n + i.price * i.qty, 0);
+        const total = items.reduce((n, i) => n + (i.price + i.fee) * i.qty, 0);
         if (total > S.funds) return { ok: false, error: 'Brak środków na koncie firmy' };
         return { ok: true, funds: S.funds - total, order: { id: 'zam-' + (3005 + shop().out.length), items, total } };
     }
@@ -553,7 +563,8 @@ const addHistory = entry => { S.history.unshift({ ...entry, by: fullName(S.me), 
    ========================================================= */
 
 /* ---------- Pracownicy: lista · profil · zatrudnianie ---------- */
-const EMP = { view: 'list', ssn: null, hireGrade: 0, tab: null, off: { plus: 0, commend: 0, promo: 0 } };     // view: list | profile | hire
+const EMP = { view: 'list', ssn: null, hireGrade: 0, tab: null, off: { plus: 0, commend: 0, promo: 0 }, empTab: 'own', relJob: null };
+// empTab: 'own' = własna firma, 'rel' = podgląd innych prac (Config.ViewJobs); relJob = wybrana praca
 const navEmp = () => { renderWin('employees'); const b = $('.win[data-win=employees] .body'); if (b) b.scrollTop = 0; };
 const featOn = k => !!S.features?.[k];
 const canManageGrade = e => !isBossGrade(e.grade) && e.ssn !== S.me.ssn;
@@ -576,7 +587,71 @@ function appEmployees() {
         if (e) return viewProfile(e);
         EMP.view = 'list';
     }
+    if (EMP.empTab === 'rel' && S.related.length) return viewRelated();
     return viewList();
+}
+
+/* --- zakładka: listy pracowników innych prac (tylko do czytania) --- */
+function viewRelated() {
+    const groups = S.related || [];
+    if (!groups.length) { EMP.empTab = 'own'; return viewList(); }
+    if (!groups.some(g => g.job === EMP.relJob)) EMP.relJob = groups[0].job;
+    const g = groups.find(x => x.job === EMP.relJob) || groups[0];
+    const list = [...(g.employees || [])].sort((a, b) => (b.otherJob ? 0 : 1) - (a.otherJob ? 0 : 1) || b.grade - a.grade || fullName(a).localeCompare(fullName(b)));
+    const duty = list.filter(e => statusOf(e) === 'duty' && !e.otherJob).length;
+
+    const rows = list.map(e => `
+        <tr class="border-t border-slate-800/70 ${e.otherJob ? 'opacity-60' : ''}">
+            <td class="py-2 pl-4 pr-2">
+                <div class="flex items-center gap-3">
+                    <div class="relative shrink-0">
+                        <div class="size-9 rounded-lg ${isBossGrade(e.grade) ? 'bg-brand text-white' : 'bg-slate-800 text-slate-200'} font-extrabold text-xs flex items-center justify-center">${esc(initials(fullName(e)))}</div>
+                        <span class="absolute -bottom-0.5 -right-0.5 size-3 rounded-full border-2 border-slate-900 ${STATUS[statusOf(e)].dot}"></span>
+                    </div>
+                    <div class="min-w-0">
+                        <p class="text-sm font-bold text-white truncate">${esc(fullName(e))}</p>
+                        <p class="text-[11px] font-mono text-slate-500">SSN ${esc(e.ssn)}${e.phonenumber ? ` · ${esc(e.phonenumber)}` : ''}</p>
+                    </div>
+                </div>
+            </td>
+            <td class="px-2"><span class="inline-flex items-center px-2.5 py-1 rounded-lg text-xs font-bold border border-slate-700/60 bg-slate-800/60 text-slate-300 whitespace-nowrap">Stopień ${e.grade}</span></td>
+            <td class="px-2 text-xs text-slate-400 whitespace-nowrap">${esc(fmtAt(e.hiredAt))}</td>
+            <td class="px-2 text-xs whitespace-nowrap">${e.otherJob
+                ? `<span class="font-bold text-amber-400">Inna praca</span><span class="text-slate-500"> · ${esc(e.otherJob)}</span>`
+                : `<span class="font-bold ${STATUS[statusOf(e)].text}">${STATUS[statusOf(e)].label}</span>`}</td>
+            <td class="px-2 text-xs font-bold whitespace-nowrap ${e.hoursWeek ? 'text-slate-200' : 'text-slate-600'}">${esc(fmtHours(e.hoursWeek))}</td>
+        </tr>`).join('');
+
+    const jobBtn = x => `<button data-act="empRel" data-job="${esc(x.job)}" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition ${x.job === g.job ? 'bg-brand text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800'}">
+        ${esc(x.label)}<span class="px-1.5 rounded-md text-[10px] ${x.job === g.job ? 'bg-white/20 text-white' : 'bg-slate-800 text-slate-400'}">${(x.employees || []).length}</span></button>`;
+
+    return `
+    ${empTabs()}
+    <div class="shrink-0 flex items-center justify-between gap-3">
+        <div class="flex gap-1 p-1 rounded-xl bg-slate-900 border border-slate-800">${groups.map(jobBtn).join('')}</div>
+        <span class="flex items-center gap-2 text-xs text-slate-400"><span class="text-sky-400">${icon('eye', 'size-4')}</span>Podgląd tylko do czytania – na służbie: <b class="text-white">${duty}</b> / ${list.length}</span>
+    </div>
+    <div class="rounded-xl border border-slate-800 bg-slate-900/50 overflow-x-auto">
+        <table class="w-full text-left">
+            <thead><tr class="text-[11px] uppercase tracking-wide text-slate-500">
+                <th class="py-3 pl-4 pr-2 font-bold">Pracownik</th><th class="px-2 font-bold">Stopień</th>
+                <th class="px-2 font-bold">Zatrudniony</th><th class="px-2 font-bold">Aktywność</th><th class="px-2 font-bold">Godziny</th>
+            </tr></thead>
+            <tbody>${rows || `<tr><td colspan="5" class="text-center text-xs text-slate-400 py-10">Brak pracowników w tej pracy.</td></tr>`}</tbody>
+        </table>
+    </div>
+    <p class="text-[11px] text-slate-500 mt-3">Lista firmy <b class="text-slate-300">${esc(g.label)}</b> · zatrudnianie, zwalnianie i stopnie nadal ustawia tylko ta firma.
+        Zakres podglądu ustawia <span class="font-mono text-slate-400">Config.ViewJobs</span> (albo <span class="font-mono text-slate-400">viewJobs</span> w Config.Jobs).</p>`;
+}
+
+/* --- przełącznik zakładek w oknie „Pracownicy” --- */
+function empTabs() {
+    if (!S.related.length) return '';
+    const n = S.related.reduce((a, g) => a + (g.employees || []).length, 0);
+    const tab = (id, label, count) => `<button data-act="empTab" data-v="${id}" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition ${EMP.empTab === id ? 'bg-brand text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800'}">
+        ${label}<span class="px-1.5 rounded-md text-[10px] ${EMP.empTab === id ? 'bg-white/20 text-white' : 'bg-slate-800 text-slate-400'}">${count}</span></button>`;
+    return `<div class="shrink-0 flex gap-1 p-1 rounded-xl bg-slate-900 border border-slate-800">
+        ${tab('own', 'Moja firma', S.employees.length)}${tab('rel', 'Inne prace', n)}</div>`;
 }
 
 const crumb = (...parts) => `
@@ -588,6 +663,7 @@ const crumb = (...parts) => `
 /* --- lista --- */
 function viewList() {
     const q = S.search.trim().toLowerCase(), qd = q.replace(/\D/g, '');
+    const tabs = empTabs();
     const bdg = featOn('badges');
     const list = S.employees
         .filter(e => S.filter === 'all' || S.filter === statusOf(e))
@@ -600,6 +676,7 @@ function viewList() {
             ? 'bg-brand text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800'}">${label}</button>`;
 
     const statusCell = e => {
+        if (e.otherJob) return `<span class="font-bold text-amber-400">Inna praca</span><span class="text-slate-500"> · ${esc(e.otherJob)}</span>`;
         const k = statusOf(e), st = STATUS[k];
         return `<span class="font-bold ${st.text}">${st.label}</span>${k === 'off' ? `<span class="text-slate-600"> · ${esc(sinceOff(e))}</span>` : ''}`;
     };
@@ -649,6 +726,7 @@ function viewList() {
             ${icon('user-plus', 'size-4')} Zatrudnij
         </button>
     </div>
+    ${tabs}
     <div class="rounded-xl border border-slate-800 bg-slate-900/50 overflow-x-auto">
         <table class="w-full text-left">
             <thead>
@@ -841,6 +919,11 @@ const listPanel = ({ key, title, ic, count, rows, add = '', cls = '' }) => {
 function viewProfile(e) {
     const boss = isBossGrade(e.grade), self = sameSsn(e.ssn, S.me.ssn), manage = canManageGrade(e);
     const F = { lic: featOn('licenses'), badge: featOn('badges'), rec: featOn('records') };
+    const otherJobBar = e.otherJob ? `
+    <div class="shrink-0 flex items-start gap-2.5 px-3.5 py-2.5 rounded-xl bg-amber-500/10 border border-amber-500/25 text-[11px] leading-4 text-amber-200">
+        <span class="shrink-0 mt-px">${icon('alert-triangle', 'size-4')}</span>
+        <p>Ta osoba jest teraz zalogowana na innej pracy: <b>${esc(e.otherJob)}</b>. Dane poniżej pochodzą z listy tej firmy, a aktywność pokazujemy jako „poza służbą”.</p>
+    </div>` : '';
     const recs = e.records || [], promos = e.promotions || [];
     const cnt = k => recs.filter(r => r.kind === k && !r.voided).length;      // unieważnione nie wliczają się do statystyk
 
@@ -942,6 +1025,7 @@ function viewProfile(e) {
 
     return `<div class="h-full flex flex-col gap-2.5">
         <div class="shrink-0">${crumb('Pracownicy', esc(fullName(e)))}</div>
+        ${otherJobBar}
         ${header}
         <div class="flex-1 min-h-0 grid gap-3 grid-rows-[minmax(0,1fr)] ${cols.length === 3 ? 'grid-cols-3' : 'grid-cols-1'}">${cols.join('')}</div>
     </div>`;
@@ -1203,7 +1287,7 @@ function appFaction() {
     <section class="shrink-0 rounded-xl bg-slate-900/70 border border-slate-800 p-3.5 flex items-center justify-between gap-3">
         <div class="min-w-0">
             <p class="flex items-center gap-1.5 text-[10px] font-bold uppercase tracking-wide text-slate-500"><span class="text-brand">${icon('wallet', 'size-3.5')}</span>Stan konta</p>
-            <p class="text-[26px] leading-8 font-extrabold text-white mt-1 truncate">${money(S.funds)}</p>
+            <p class="leading-8 font-extrabold text-white mt-1 break-all" style="font-size:${moneyFs(money(S.funds))}px">${money(S.funds)}</p>
         </div>
         <div class="flex flex-col gap-1.5 shrink-0">
             <button data-act="deposit" class="flex items-center justify-center gap-1.5 px-3.5 py-1.5 rounded-lg text-xs font-bold text-white bg-brand hover:opacity-90 transition">${icon('plus', 'size-3.5')}Wpłać</button>
@@ -1407,6 +1491,7 @@ const GAR = { tab: 'vehicles', search: '', filter: 'all', cat: 'all', csearch: '
 let GAR_UID = 0;
 const CART_MAX = 10;                                          // maks. pojazdów w jednym zamówieniu (serwer też powinien to sprawdzać)
 const expressFee = c => Math.max(0, Number(c?.expressFee ?? S.expressFee ?? 0));      // dopłata za szybki transport (za 1 pojazd)
+const goodsFee = p => Math.max(0, Number(p?.expressFee ?? S.goodsExpressFee ?? 0));    // to samo dla towarów z zamówień B2B (za 1 sztukę)
 const cartLines = () => GAR.cart.map(it => ({ ...it, c: S.catalog.find(x => x.model === it.model) })).filter(l => l.c);
 const lineCost = l => l.c.price + (l.express ? expressFee(l.c) : 0);
 function cartTotals() {
@@ -1442,7 +1527,7 @@ function garageTabs() {
             ${tab('vehicles', 'Pojazdy', S.vehicles.length)}${tab('catalog', 'Katalog', GAR.cart.length || S.catalog.length, GAR.cart.length > 0)}${tab('orders', 'Zamówienia', pend || S.orders.length, pend > 0)}
         </div>
         <div class="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-800 text-xs">
-            <span class="text-brand">${icon('wallet', 'size-4')}</span><span class="font-bold text-slate-400">Saldo firmy</span><span class="font-extrabold text-white">${money(S.funds)}</span>
+            <span class="text-brand">${icon('wallet', 'size-4')}</span><span class="font-bold text-slate-400">Saldo firmy</span><span class="font-extrabold text-white break-all">${money(S.funds)}</span>
         </div>
     </div>`;
 }
@@ -1826,7 +1911,9 @@ function devAdvanceOrder(id, to) {
 const SHOP = { tab: 'order', sup: null, search: '', cat: 'all', cart: {}, note: {}, outF: 'all', outQ: '', inF: 'all', inQ: '', offQ: '', busy: false };
 const SHOP_LINES = 20;               // maks. pozycji w jednym zamówieniu
 const QTY_MAX = 99;                  // maks. sztuk jednej pozycji
-const PRODUCT_MAX = 1000000;         // maks. cena produktu w ofercie (serwer waliduje ponownie)
+const PRODUCT_MAX = 100000000;       // zapas, gdyby serwer nie przysłał limitu (Config.Goods.maxPrice)
+const MONEY_MAX = 100000000;         // maks. kwota wpłaty/wypłaty – taka sama jak walidacja na serwerze
+const priceMax = () => Number(S.maxPrice) > 0 ? Number(S.maxPrice) : PRODUCT_MAX;
 const shop = () => {
     const s = S.shop = S.shop || {};
     s.suppliers = s.suppliers || []; s.out = s.out || []; s.incoming = s.incoming || []; s.companies = s.companies || [];
@@ -1835,8 +1922,9 @@ const shop = () => {
 };
 const atKey = at => { const m = /^(\d{2})\.(\d{2})\.(\d{4})(?:\s+(\d{2}):(\d{2}))?/.exec(String(at || '')); return m ? Date.UTC(+m[3], +m[2] - 1, +m[1], +(m[4] || 0), +(m[5] || 0)) : 0; };
 const sameId = (a, b) => String(a) === String(b);
-/* dostęp do produktu: product.access = null/brak (wszystkie firmy) albo tablica jobów firm, które mogą zamawiać */
-const canBuy = p => p.active !== false && (!Array.isArray(p.access) || p.access.includes(S.job.name));
+/* dostęp do produktu: product.access = null/brak (wszystkie firmy) albo tablica jobów firm, które mogą zamawiać.
+   Pozycje z modelem pojazdu zamawia się w Garażu (katalog), więc nie pokazują się w zamówieniach towarowych. */
+const canBuy = p => p.active !== false && !p.model && (!Array.isArray(p.access) || p.access.includes(S.job.name));
 const coName = job => (shop().companies || []).find(c => sameId(c.job, job))?.label || job;
 const plFirm = n => n === 1 ? 'firma' : (n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20)) ? 'firmy' : 'firm';
 const plPoz = n => n === 1 ? 'pozycja' : (n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20)) ? 'pozycje' : 'pozycji';
@@ -1844,8 +1932,8 @@ const plPoz = n => n === 1 ? 'pozycja' : (n % 10 >= 2 && n % 10 <= 4 && (n % 100
 /* wspólny widok zamówienia towarów (shop.out / shop.incoming) i pojazdów (S.orders z Garażu) */
 const shopLines = (o, kind) => kind === 'vehicles'
     ? ordItems(o).map(i => ({ name: i.name, qty: 1, price: i.price, fee: i.express ? (i.fee || 0) : 0, express: !!i.express }))
-    : (o.items || []).map(i => ({ name: i.name, qty: i.qty || 1, price: i.price, fee: 0, express: false }));
-const shopTotal = (o, kind) => kind === 'vehicles' ? ordTotal(o) : (o.total ?? shopLines(o, kind).reduce((n, l) => n + l.price * l.qty, 0));
+    : (o.items || []).map(i => ({ name: i.name, qty: i.qty || 1, price: i.price, fee: i.express ? (i.fee || 0) : 0, express: !!i.express }));
+const shopTotal = (o, kind) => kind === 'vehicles' ? ordTotal(o) : (o.total ?? shopLines(o, kind).reduce((n, l) => n + (l.price + l.fee) * l.qty, 0));
 const shopUnits = ls => ls.reduce((n, l) => n + l.qty, 0);
 const shopSum = ls => ls.map(l => l.qty > 1 ? `${l.name} ×${l.qty}` : l.name).join(', ');
 const shopCount = (ls, kind) => kind === 'vehicles' ? `${ls.length} ${plVeh(ls.length)}` : `${shopUnits(ls)} szt. · ${ls.length} ${plPoz(ls.length)}`;
@@ -1875,7 +1963,10 @@ const cartRaw = () => SHOP.cart[SHOP.sup] || (SHOP.cart[SHOP.sup] = []);
 function shopCartTotals() {
     const sp = shopSupplier(), raw = sp ? cartRaw() : [];
     const ls = raw.map(c => ({ ...c, p: (sp.products || []).find(p => sameId(p.id, c.id) && canBuy(p)) })).filter(l => l.p);
-    return { sp, ls, lines: ls.length, units: shopUnits(ls), total: ls.reduce((n, l) => n + l.p.price * l.qty, 0) };
+    ls.forEach(l => { const fee = goodsFee(l.p); l.fee = l.express && fee > 0 ? fee : 0; });
+    const sub = ls.reduce((n, l) => n + l.p.price * l.qty, 0);
+    const exp = ls.reduce((n, l) => n + l.fee * l.qty, 0);
+    return { sp, ls, lines: ls.length, units: shopUnits(ls), sub, exp, nExp: ls.filter(l => l.fee > 0).length, total: sub + exp };
 }
 
 function shopTabs() {
@@ -1889,7 +1980,7 @@ function shopTabs() {
             ${tab('order', 'Zamów', cartN || sh.suppliers.length, cartN > 0)}${tab('mine', 'Moje zamówienia', outList().length)}${sh.offer || sh.incoming.length ? tab('in', 'Przychodzące', pendIn || sh.incoming.length, pendIn > 0) : ''}${sh.offer ? tab('offer', 'Oferta', sh.offer.products.length) : ''}
         </div>
         <div class="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-800 text-xs">
-            <span class="text-brand">${icon('wallet', 'size-4')}</span><span class="font-bold text-slate-400">Saldo firmy</span><span class="font-extrabold text-white">${money(S.funds)}</span>
+            <span class="text-brand">${icon('wallet', 'size-4')}</span><span class="font-bold text-slate-400">Saldo firmy</span><span class="font-extrabold text-white break-all">${money(S.funds)}</span>
         </div>
     </div>`;
 }
@@ -1944,19 +2035,27 @@ function shopOrder() {
 function shopCartPanel() {
     const T = shopCartTotals(), poor = T.total > S.funds, ok = T.lines && !poor;
     const stepBtn = (d, ic, id) => `<button data-act="shopQty" data-id="${esc(id)}" data-d="${d}" class="size-6 rounded-md bg-slate-800 text-slate-300 hover:bg-slate-700 hover:text-white flex items-center justify-center transition">${icon(ic, 'size-3.5')}</button>`;
-    const line = l => `
+    const line = l => {
+        const fee = goodsFee(l.p);
+        return `
         <li class="rounded-xl border bg-slate-950/40 border-slate-800 p-2 space-y-1.5">
             <div class="flex items-center gap-2 min-w-0">
                 <span class="text-emerald-400 shrink-0">${icon('box', 'size-4')}</span>
                 <p class="flex-1 min-w-0 text-xs font-bold text-white truncate" title="${esc(l.p.name)}">${esc(l.p.name)}</p>
                 <button data-act="shopRemove" data-id="${esc(l.id)}" title="Usuń z koszyka" class="p-1 rounded-md text-slate-500 hover:text-white hover:bg-brand transition">${icon('x', 'size-3.5')}</button>
             </div>
+            ${fee > 0 ? `<button data-act="shopExpress" data-id="${esc(l.id)}" class="w-full flex items-center justify-between gap-2 px-2 py-1 rounded-lg border text-[11px] font-bold transition ${l.fee
+                ? 'bg-amber-500/10 border-amber-500/30 text-amber-300' : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white hover:border-slate-700'}">
+                <span class="flex items-center gap-1.5">${icon('bolt', 'size-3.5')}Szybki transport</span>
+                <span class="flex items-center gap-1.5">+${money(fee)}<span class="size-3.5 rounded border flex items-center justify-center ${l.fee ? 'bg-amber-400 border-amber-400 text-slate-900' : 'border-slate-600'}">${l.fee ? icon('check', 'size-3') : ''}</span></span>
+            </button>` : ''}
             <div class="flex items-center justify-between gap-2">
                 <div class="flex items-center gap-1">${stepBtn(-1, 'minus', l.id)}<span class="w-8 text-center text-xs font-extrabold text-white">${l.qty}</span>${stepBtn(1, 'plus', l.id)}</div>
                 <span class="text-[10px] font-semibold text-slate-500">${money(l.p.price)} × ${l.qty}</span>
-                <span class="text-xs font-extrabold text-white whitespace-nowrap">${money(l.p.price * l.qty)}</span>
+                <span class="text-xs font-extrabold text-white whitespace-nowrap">${money((l.p.price + l.fee) * l.qty)}</span>
             </div>
         </li>`;
+    };
     const sum = (l, v, cls = 'text-slate-200') => `<div class="flex items-center justify-between text-[11px]"><span class="text-slate-500 font-semibold">${l}</span><span class="font-bold ${cls}">${v}</span></div>`;
     return `
     <aside class="w-[292px] shrink-0 flex flex-col min-h-0 rounded-xl bg-slate-900/60 border border-slate-800 p-3">
@@ -1970,6 +2069,7 @@ function shopCartPanel() {
         <div class="shrink-0 mt-2.5 pt-2.5 border-t border-slate-800/70 space-y-1">
             <textarea id="shopNote" rows="2" maxlength="200" placeholder="Uwagi dla dostawcy (opcjonalnie)…" class="w-full resize-none mb-1 bg-slate-950/60 border border-slate-800 rounded-lg px-2.5 py-1.5 text-[11px] text-white placeholder-slate-500 focus:border-brand/50 outline-none">${esc(SHOP.note[SHOP.sup] || '')}</textarea>
             ${sum(`Sztuk`, String(T.units))}
+            ${T.exp ? sum(`Szybki transport (${T.nExp})`, money(T.exp), 'text-amber-300') : ''}
             <div class="flex items-center justify-between pt-1"><span class="text-xs font-bold text-slate-300">Razem</span><span class="text-[17px] leading-5 font-extrabold text-white">${money(T.total)}</span></div>
             ${sum('Saldo firmy', money(S.funds), poor ? 'text-brand' : 'text-emerald-400')}
             ${poor ? `<p class="text-[11px] font-semibold text-brand">Brakuje ${money(T.total - S.funds)}</p>` : ''}
@@ -1993,14 +2093,14 @@ function shopRow({ o, kind }, side) {
         ? `${gBtn('shopInfo', 'list-details', '', `${id} title="Szczegóły"`)}${o.status === 'pending' ? gBtn('shopCancel', 'x', 'Anuluj', id, 'bg-slate-800 text-slate-200 hover:bg-brand hover:text-white') : ''}`
         : `${gBtn('shopInfo', 'list-details', '', `${id} title="Szczegóły"`)}
            ${o.status === 'pending' ? gBtn('shopReject', 'ban', 'Odrzuć', id, 'bg-slate-800 text-slate-200 hover:bg-brand hover:text-white') + gBtn('shopAccept', 'check', 'Przyjmij', id, 'bg-emerald-500/15 text-emerald-300 hover:bg-emerald-500 hover:text-white') : ''}
-           ${o.status === 'accepted' ? gBtn('shopDeliver', 'truck-delivery', 'Dostarczono', id, 'bg-sky-500/15 text-sky-300 hover:bg-sky-500 hover:text-white') : ''}`;
+           ${o.status === 'accepted' ? gBtn('shopDeliver', 'truck-delivery', 'Dostarczono', `${id} ${o.delivery === 'physical' ? 'title="To zamówienie jedzie lawetą (tr2). Pojazdy wpisuje do garażu dopiero oddanie aut na miejscu odbioru – z panelu zadziała tylko przy włączonym manualOverride."' : ''}`.trim(), 'bg-sky-500/15 text-sky-300 hover:bg-sky-500 hover:text-white') : ''}`;
     return `
     <li class="flex items-center gap-3 px-3 py-2 rounded-xl border min-w-0 ${dim ? 'bg-slate-950/20 border-slate-800/60' : 'bg-slate-950/40 border-slate-800'}">
         <div class="size-9 shrink-0 rounded-lg border flex items-center justify-center ${TONES[st.tone]}">${icon(st.ic, 'size-5')}</div>
         <div class="flex-1 min-w-0">
             <div class="flex items-center gap-2 min-w-0">
                 <p class="text-xs font-bold whitespace-nowrap ${dim ? 'text-slate-500' : 'text-white'}">Zamówienie ${esc(ordNo(o))}</p>
-                ${kind === 'vehicles' ? stChip('sky', 'Pojazdy', 'car') : stChip('emerald', 'Towary', 'box')}${stChip(st.tone, st.label, null)}${nExp ? stChip('amber', `Szybki transport ×${nExp}`, 'bolt') : ''}
+                ${kind === 'vehicles' ? stChip('sky', 'Pojazdy', 'car') : stChip('emerald', 'Towary', 'box')}${stChip(st.tone, st.label, null)}${o.delivery === 'physical' && !dim ? stChip('violet', 'Laweta CD', 'truck-delivery') : ''}${nExp ? stChip('amber', `Szybki transport ×${nExp}`, 'bolt') : ''}
             </div>
             <p class="text-[10px] text-slate-500 truncate" title="${esc(shopSum(ls))}">${party} · ${esc(shopSum(ls))}</p>
             <p class="text-[10px] text-slate-600 truncate">${esc(o.by)} · ${esc(fmtAt(o.at))}${tail ? ` · ${tail}` : ''}</p>
@@ -2078,7 +2178,7 @@ function shopOffer() {
     return `
     <div class="shrink-0 flex items-start gap-2.5 px-3.5 py-2.5 rounded-xl bg-sky-500/5 border border-sky-500/20 text-[11px] leading-4 text-slate-300">
         <span class="text-sky-400 shrink-0 mt-px">${icon('info-circle', 'size-4')}</span>
-        <p>Domyślnie produkty widzą wszystkie firmy w zakładce „Zamów” – w edycji produktu możesz ograniczyć dostęp do wybranych firm. Ukryty produkt zostaje w ofercie, ale nie można go zamówić. Zmiana ceny nie wpływa na złożone już zamówienia.${S.vehicleSupplier ? ' Twoje pozycje z modelem pojazdu tworzą katalog w Garażu – tam ustawiasz też dopłatę za szybki transport.' : ''}</p>
+        <p>Domyślnie produkty widzą wszystkie firmy w zakładce „Zamów” – w edycji produktu możesz ograniczyć dostęp do wybranych firm. Ukryty produkt zostaje w ofercie, ale nie można go zamówić. Zmiana ceny nie wpływa na złożone już zamówienia. Dopłata „Szybki transport” doliczana jest za każdą sztukę, gdy zamawiający zaznaczy ją w koszyku.${S.vehicleSupplier ? ' Twoje pozycje z modelem pojazdu tworzą katalog w Garażu (i nie pokazują się w zamówieniach towarowych) – tam ustawiasz też dopłatę za szybki transport pojazdu.' : ''}</p>
     </div>
     <div class="shrink-0 flex gap-3">${gSearch('offSearch', SHOP.offQ, 'Szukaj w swojej ofercie…')}</div>
     ${listPanel({ key: 'offer', title: 'Moja oferta', ic: 'building-store', count: list.length, rows: list.map(row), add: gBtn('offAdd', 'plus', 'Dodaj produkt', '', 'text-white bg-brand hover:opacity-90'), cls: 'flex-1' })}`;
@@ -2104,6 +2204,7 @@ function shopCartAct(type, el) {
         if (cart[i].qty > QTY_MAX) { cart[i].qty = QTY_MAX; toast(`Maksymalnie ${QTY_MAX} szt. jednego produktu`, 'warn'); }
         if (cart[i].qty < 1) cart.splice(i, 1);
     } else if (type === 'remove' && i >= 0) cart.splice(i, 1);
+    else if (type === 'express' && i >= 0) cart[i].express = !cart[i].express;
     else if (type === 'clear') { cart.length = 0; SHOP.note[SHOP.sup] = ''; }
     renderWin('orders');
 }
@@ -2120,12 +2221,13 @@ function openShopCheckout() {
             return `<div class="space-y-3">
             <ul class="max-h-44 overflow-y-auto space-y-1 pr-0.5">${t.ls.map(l => `
                 <li class="flex items-center gap-2 px-2.5 py-1.5 rounded-lg bg-slate-950/50 border border-slate-800 text-xs">
-                    <span class="flex-1 min-w-0 truncate font-bold text-white">${esc(l.p.name)}</span>
-                    <span class="text-[11px] font-semibold text-slate-500 whitespace-nowrap">${money(l.p.price)} × ${l.qty}</span>
-                    <span class="font-extrabold text-slate-200 whitespace-nowrap">${money(l.p.price * l.qty)}</span>
+                    <span class="flex-1 min-w-0 truncate font-bold text-white">${esc(l.p.name)}${l.fee ? ' ⚡' : ''}</span>
+                    <span class="text-[11px] font-semibold text-slate-500 whitespace-nowrap">${money(l.p.price)} × ${l.qty}${l.fee ? ` <span class="text-amber-400">+${money(l.fee)}/szt.</span>` : ''}</span>
+                    <span class="font-extrabold text-slate-200 whitespace-nowrap">${money((l.p.price + l.fee) * l.qty)}</span>
                 </li>`).join('')}</ul>
             ${note ? `<p class="text-[11px] leading-4 text-slate-400 break-words">Uwagi: <span class="text-slate-300">${esc(note)}</span></p>` : ''}
             <div class="rounded-xl bg-slate-950/50 border border-slate-800 p-3 space-y-1.5">
+                ${t.exp ? row('Szybki transport', money(t.exp), 'text-amber-300') : ''}
                 ${row('Razem', money(t.total))}${row('Saldo konta', money(S.funds))}
                 ${row('Saldo po zamówieniu', money(S.funds - t.total), S.funds - t.total < 0 ? 'text-brand' : 'text-emerald-400')}
             </div>
@@ -2136,16 +2238,16 @@ function openShopCheckout() {
             const t = shopCartTotals();
             if (t.total > S.funds) return toast('Brak środków na koncie firmy', 'error'), false;
             const note = (SHOP.note[sp.job] || '').trim();
-            return modalRequest(o, M, 'bossmenu:orderGoods', { supplier: sp.job, items: t.ls.map(l => ({ id: l.id, qty: l.qty })), note }, 'Nie udało się złożyć zamówienia', res => {
-                const items = t.ls.map(l => ({ id: l.id, name: l.p.name, price: l.p.price, qty: l.qty }));
+            return modalRequest(o, M, 'bossmenu:orderGoods', { supplier: sp.job, items: t.ls.map(l => ({ id: l.id, qty: l.qty, express: !!l.fee })), note }, 'Nie udało się złożyć zamówienia', res => {
+                const items = t.ls.map(l => ({ id: l.id, name: l.p.name, price: l.p.price, qty: l.qty, express: !!l.fee, fee: l.fee }));
                 const order = { id: 'zam-' + Date.now(), kind: 'goods', supplier: { job: sp.job, label: sp.label }, buyer: { job: S.job.name, label: S.job.label },
                     items, total: t.total, by: fullName(S.me), at: nowFull(), status: 'pending', ...(note ? { note } : {}), ...res.order };
                 shop().out.unshift(order);
                 S.funds = res.funds ?? S.funds - t.total;
-                addTx('out', t.total, 'Zamówienie towarów', `${sp.label}: ${shopSum(t.ls.map(l => ({ name: l.p.name, qty: l.qty })))}`);
-                addHistory({ type: 'goodsOrder', orderId: order.id, supplier: sp.label, lines: items.length, units: t.units, total: t.total, items: items.map(i => i.qty > 1 ? `${i.name} ×${i.qty}` : i.name) });
+                addTx('out', t.total, 'Zamówienie towarów', `${sp.label}: ${shopSum(t.ls.map(l => ({ name: l.p.name + (l.fee ? ' ⚡' : ''), qty: l.qty })))}`);
+                addHistory({ type: 'goodsOrder', orderId: order.id, supplier: sp.label, lines: items.length, units: t.units, total: t.total, items: items.map(i => (i.qty > 1 ? `${i.name} ×${i.qty}` : i.name) + (i.express ? ' ⚡' : '')) });
                 SHOP.cart[sp.job] = []; SHOP.note[sp.job] = ''; SHOP.tab = 'mine'; EMP.off.ordOut = 0;
-                toast('Zamówienie złożone – czeka na akceptację dostawcy', 'success');
+                toast(t.exp ? 'Zamówienie z szybkim transportem złożone – czeka na akceptację dostawcy' : 'Zamówienie złożone – czeka na akceptację dostawcy', 'success');
             });
         }
     };
@@ -2201,7 +2303,7 @@ function shopHandle(id, action) {            // action: accept | reject | delive
     const cfg = {
         accept: { icon: 'check', title: 'Przyjąć zamówienie?', ok: 'Przyjmij', text: `${ordNo(o)} · ${buyerName(o)} · ${money(total)}. Zamawiający zobaczy status „W realizacji”.` },
         reject: { icon: 'ban', title: 'Odrzucić zamówienie?', ok: 'Odrzuć', text: `${ordNo(o)} · ${buyerName(o)} · ${money(total)} wróci na konto zamawiającego.` },
-        deliver: { icon: 'truck-delivery', title: 'Oznaczyć jako dostarczone?', ok: 'Dostarczono', text: `${ordNo(o)} · ${buyerName(o)}. Kwota ${money(total)} trafi na konto firmy${kind === 'vehicles' ? ', a pojazdy do garażu zamawiającego' : ''}.` }
+        deliver: { icon: 'truck-delivery', title: 'Oznaczyć jako dostarczone?', ok: 'Dostarczono', text: `${ordNo(o)} · ${buyerName(o)}. Kwota ${money(total)} trafi na konto firmy${kind === 'vehicles' ? ', a pojazdy do garażu zamawiającego' : ''}.${o.delivery === 'physical' ? ' UWAGA: te pojazdy są/będą na lawecie `tr2` – normalnie zamówienie zamyka się samo, gdy pracownik CD odda auta na miejscu odbioru.' : ''}` }
     }[action];
     const mo = {
         icon: cfg.icon, tone: 'brand', title: cfg.title, text: cfg.text, ok: cfg.ok, needReason: action === 'reject',
@@ -2245,18 +2347,22 @@ function openProductModal(id) {
             <div class="grid grid-cols-2 gap-3">
                 ${inp('prodCat', 'Kategoria', p?.category || '', 'np. Narzędzia', 'maxlength="30"')}
                 <label class="block">${fieldLabel('Cena za sztukę')}<div class="relative"><span class="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-500 text-sm font-bold">$</span>
-                    <input id="prodPrice" inputmode="numeric" maxlength="7" value="${esc(p?.price ?? '')}" placeholder="0" autocomplete="off"
+                    <input id="prodPrice" inputmode="numeric" maxlength="9" value="${esc(p?.price ?? '')}" placeholder="0" autocomplete="off"
                     class="w-full bg-slate-950/60 border border-slate-800 rounded-xl pl-7 pr-3 py-2.5 text-sm font-bold text-white placeholder-slate-500 focus:border-brand/50 outline-none"></div></label>
             </div>
             <label class="block">${fieldLabel('Opis (opcjonalnie)')}<textarea id="prodDesc" rows="2" maxlength="120" placeholder="Krótki opis widoczny dla zamawiających…"
                 class="w-full resize-none bg-slate-950/60 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm text-white placeholder-slate-500 focus:border-brand/50 outline-none">${esc(p?.desc || '')}</textarea></label>
-            ${isVeh ? `<div class="grid grid-cols-2 gap-3">
-                ${inp('prodModel', 'Model pojazdu (spawn)', p?.model || '', 'np. caracara2', 'maxlength="50"')}
+            <div class="${isVeh ? 'grid grid-cols-2 gap-3' : ''}">
+                ${isVeh ? `<label class="block">${fieldLabel('Model pojazdu (spawn)')}
+                    <input id="prodModel" value="${esc(p?.model || '')}" placeholder="np. caracara2" autocomplete="off" maxlength="50"
+                        class="w-full bg-slate-950/60 border border-slate-800 rounded-xl px-3.5 py-2.5 text-sm font-bold text-white placeholder-slate-500 focus:border-brand/50 outline-none"></label>` : ''}
                 <label class="block">${fieldLabel('Szybki transport (za sztukę)')}<div class="relative"><span class="absolute left-3.5 top-1/2 -translate-y-1/2 text-slate-500 text-sm font-bold">$</span>
-                    <input id="prodFee" inputmode="numeric" maxlength="7" value="${esc(p?.expressFee ?? '')}" placeholder="${esc(String(S.expressFee ?? 0))}" autocomplete="off"
+                    <input id="prodFee" inputmode="numeric" maxlength="9" value="${esc(p?.expressFee ?? '')}" placeholder="${esc(String(isVeh ? (S.expressFee ?? 0) : (S.goodsExpressFee ?? 0)))}" autocomplete="off"
                     class="w-full bg-slate-950/60 border border-slate-800 rounded-xl pl-7 pr-3 py-2.5 text-sm font-bold text-white placeholder-slate-500 focus:border-brand/50 outline-none"></div></label>
             </div>
-            <p class="text-[11px] text-slate-500">Pozycje z wpisanym modelem trafiają do katalogu w Garażu – inne firmy zamawiają je jak pojazdy. Puste pole dopłaty = kwota domyślna (${money(S.expressFee || 0)}).</p>` : ''}
+            <p class="text-[11px] text-slate-500">${isVeh
+                ? `Pozycje z wpisanym modelem tworzą katalog w Garażu i nie pokazują się w zamówieniach towarowych – inne firmy zamawiają je jak pojazdy. Puste pole dopłaty = kwota domyślna (${money(S.expressFee || 0)}).`
+                : 'Dopłata doliczana za każdą sztukę, gdy zamawiający zaznaczy w koszyku „Szybki transport”. Puste pole = brak opcji szybkiego transportu dla tego produktu.'}</p>
             <label class="flex items-center gap-3 cursor-pointer select-none">
                 <input id="prodActive" type="checkbox" class="peer sr-only" ${!p || p.active !== false ? 'checked' : ''}>
                 <span class="relative w-11 h-6 rounded-full bg-slate-700 transition peer-checked:bg-brand after:content-[''] after:absolute after:top-0.5 after:left-0.5 after:size-5 after:rounded-full after:bg-white after:shadow after:transition-transform peer-checked:after:translate-x-5"></span>
@@ -2278,13 +2384,13 @@ function openProductModal(id) {
         onOk: () => {
             const name = $('#prodName').value.trim(), category = $('#prodCat').value.trim(), desc = $('#prodDesc').value.trim(), price = parseInt($('#prodPrice').value, 10), active = $('#prodActive').checked;
             if (name.length < 2) return toast('Podaj nazwę produktu (min. 2 znaki)', 'error'), false;
-            if (!price || price < 1 || price > PRODUCT_MAX) return toast(`Cena musi być z zakresu $1 – ${money(PRODUCT_MAX)}`, 'error'), false;
+            if (!price || price < 1 || price > priceMax()) return toast(`Cena musi być z zakresu $1 – ${money(priceMax())}`, 'error'), false;
             const model = isVeh ? ($('#prodModel')?.value || '').trim() : '';
             if (model && !/^[A-Za-z0-9_-]{1,50}$/.test(model)) return toast('Model pojazdu: tylko litery, cyfry, - i _ (max 50 znaków)', 'error'), false;
-            const feeRaw = isVeh ? ($('#prodFee')?.value || '').trim() : '';
+            const feeRaw = ($('#prodFee')?.value || '').trim();
             const expressFee = feeRaw === '' ? null : parseInt(feeRaw, 10);
-            if (isVeh && feeRaw !== '' && (!Number.isFinite(expressFee) || expressFee < 0 || expressFee > PRODUCT_MAX))
-                return toast(`Dopłata za szybki transport: $0 – ${money(PRODUCT_MAX)}`, 'error'), false;
+            if (feeRaw !== '' && (!Number.isFinite(expressFee) || expressFee < 0 || expressFee > priceMax()))
+                return toast(`Dopłata za szybki transport: $0 – ${money(priceMax())}`, 'error'), false;
             const access = M.mode === 'some' ? [...M.sel] : null;
             if (access && !access.length) return toast('Wybierz co najmniej jedną firmę albo zezwól wszystkim', 'error'), false;
             if (of.products.some(x => x !== p && x.name.toLowerCase() === name.toLowerCase())) return toast('Produkt o takiej nazwie już istnieje w ofercie', 'error'), false;
@@ -2734,7 +2840,7 @@ function renderWidgets() {
             <div class="size-9 shrink-0 rounded-lg border flex items-center justify-center ${TONES[r.t]}">${icon(r.i, 'size-4')}</div>
             <div class="min-w-0">
                 <p class="text-[10px] font-semibold text-slate-400 uppercase tracking-wide truncate">${r.l}</p>
-                <p class="text-sm font-extrabold text-white truncate">${r.v()}</p>
+                <p class="font-extrabold text-white break-all leading-5" style="font-size:${valFs(r.v())}px">${r.v()}</p>
             </div>
         </div>`).join('') : '<p class="px-3 py-6 text-center text-[11px] leading-4 text-slate-500">Brak przypiętych informacji.</p>'}
         <button data-act="widgetEdit" class="w-full ${rows.length ? 'mt-1' : ''} flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg text-[11px] font-bold text-slate-500 hover:text-white hover:bg-white/5 transition">${icon('edit', 'size-3.5')}Edytuj widget</button>
@@ -3005,6 +3111,8 @@ function act(type, el) {
         /* nawigacja w aplikacji Pracownicy */
         case 'openProfile': EMP.view = 'profile'; EMP.ssn = el.dataset.ssn; EMP.off = { plus: 0, commend: 0, promo: 0 }; return navEmp();
         case 'backToList': EMP.view = 'list'; return navEmp();
+        case 'empTab': EMP.empTab = el.dataset.v === 'rel' ? 'rel' : 'own'; return navEmp();
+        case 'empRel': EMP.empTab = 'rel'; EMP.relJob = el.dataset.job; return navEmp();
         case 'openHire': return openHireModal();
 
         case 'openGradeModal': return openGradeModal(el.dataset.ssn);
@@ -3182,6 +3290,7 @@ function act(type, el) {
         case 'shopAdd': return shopCartAct('add', el);
         case 'shopQty': return shopCartAct('qty', el);
         case 'shopRemove': return shopCartAct('remove', el);
+        case 'shopExpress': return shopCartAct('express', el);
         case 'shopClear': return shopCartAct('clear', el);
         case 'shopCheckout': return openShopCheckout();
         case 'shopInfo': return openShopOrderModal(el.dataset.id);
@@ -3213,21 +3322,30 @@ function moneyModal(type) {
                 ${fieldLabel('Kwota')}
                 <div class="relative">
                     <span class="absolute left-3 top-1/2 -translate-y-1/2 text-slate-500 text-sm font-bold">$</span>
-                    <input id="amount" type="number" min="1" placeholder="0" data-autofocus
+                    <input id="amount" type="number" min="1" step="1" inputmode="numeric" placeholder="0" data-autofocus
                         class="w-full bg-slate-950/60 border border-slate-800 rounded-xl pl-7 pr-3 py-2.5 text-sm font-bold text-white focus:border-brand/50 outline-none">
                 </div></div>
                 ${dep ? '' : reasonField('Powód wypłaty').replace(' data-autofocus', '')}</div>`,
         onOk: () => {
             const amount = parseInt($('#amount').value);
             if (!amount || amount <= 0) return toast('Podaj poprawną kwotę', 'error'), false;
+            if (amount > MONEY_MAX) return toast(`Maksymalna kwota jednej operacji to ${money(MONEY_MAX)}`, 'error'), false;
             if (!dep && amount > S.funds) return toast('Firma nie ma tylu środków', 'error'), false;
             if (!dep && reasonValue().length < REASON_MIN) return toast(`Podaj powód (min. ${REASON_MIN} znaków)`, 'error'), false;
             const reason = dep ? '' : reasonValue();
-            S.funds += dep ? amount : -amount;
-            EMP.off.tx = 0;
-            S.transactions.unshift({ type: dep ? 'in' : 'out', amount, by: fullName(S.me), label: dep ? 'Wpłata' : 'Wypłata', reason, at: stamp() });
-            post('bossmenu:' + type, dep ? { amount } : { amount, reason });
-            toast(`${dep ? 'Wpłacono' : 'Wypłacono'} ${money(amount)}`, 'success'); refresh();
+
+            // Wcześniej: `post()` (bez odpowiedzi) + zmiana salda i toast PRZED zapisem – gdy serwer
+            // odrzucił operację (brak środków / brak konta firmy), panel i tak pokazywał sukces.
+            request('bossmenu:' + type, dep ? { amount } : { amount, reason }).then(res => {
+                if (!res?.ok) return toast(res?.error || 'Operacja nie powiodła się', 'error');
+
+                const funds = Number(res.funds);
+                S.funds = Number.isFinite(funds) ? funds : S.funds + (dep ? amount : -amount);
+                EMP.off.tx = 0;
+                S.transactions.unshift({ type: dep ? 'in' : 'out', amount, by: fullName(S.me), label: dep ? 'Wpłata' : 'Wypłata', reason, at: stamp() });
+                toast(`${dep ? 'Wpłacono' : 'Wypłacono'} ${money(amount)}`, 'success');
+                refresh();
+            });
         }
     });
 }
@@ -3264,7 +3382,14 @@ function closeModal() { $('#modalRoot').innerHTML = ''; MODAL = null; closeSelec
 const modalOpen = () => !!$('#modal');
 function submitModal() { if (MODAL?.onOk && MODAL.onOk() !== false) closeModal(); }
 
+let LAST_TOAST = { key: '', at: 0 };
 function toast(msg, type = 'info', force = false) {
+    // Serwer wysyła `notify` przy każdej odrzuconej akcji, a UI pokazuje `res.error` – to ten sam
+    // komunikat, więc przez ~1 s nie dublujemy go na ekranie.
+    const key = type + '|' + String(msg), now = Date.now();
+    if (!force && LAST_TOAST.key === key && now - LAST_TOAST.at < 1000) return;
+    LAST_TOAST = { key, at: now };
+
     sfx(type === 'success' ? 'success' : type === 'error' ? 'error' : type === 'warn' ? 'warn' : 'info');
     if (!force && (CFG.notif === 'off' || (CFG.notif === 'errors' && type !== 'error' && type !== 'warn'))) return;
     const t = {

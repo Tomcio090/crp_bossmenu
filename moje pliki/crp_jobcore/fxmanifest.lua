@@ -4,7 +4,7 @@ lua54 'yes'
 
 author "CentrumRP"
 description 'JobCore'
-version '1.0'
+version '1.0.4'
 
 ui_page "web/index.html"
 

@@ -123,6 +123,21 @@ local function asText(value)
     return tostring(value)
 end
 
+-- Kolumny `TINYINT(1)` (np. active) wracają z bazy raz jako 1/0 (mysql-async), a raz jako
+-- true/false (oxmysql ma typecast zgodny z mysql-async). Wszystkie porównania robimy przez
+-- flag(), żeby działały w obu przypadkach – inaczej `p.active == 1` jest zawsze fałszywe.
+local function flag(value)
+    return value == true or value == 1 or value == '1' or value == 'true'
+end
+
+-- JSON z kolumn tekstowych (access/grades/licenses) – nigdy nie wywala loadera
+local function decodeJson(value, fallback)
+    if type(value) ~= 'string' or value == '' then return fallback end
+    local ok, decoded = pcall(json.decode, value)
+    if not ok or type(decoded) ~= 'table' then return fallback end
+    return decoded
+end
+
 -- dzieli listę na porcje (żeby zapytanie IN (...) nie było za długie)
 local function chunks(list, size)
     local out, current = {}, {}
@@ -266,6 +281,7 @@ local TABLES_DEF = {
             'items LONGTEXT NOT NULL',
             'total BIGINT NOT NULL',
             'status VARCHAR(12) NOT NULL DEFAULT \'pending\'',
+            'delivery VARCHAR(12) NULL',        -- 'physical' = pojazdy dostarczane lawetą (nano skrypt CD)
             'note VARCHAR(300) NULL',
             'reason VARCHAR(500) NULL',
             'by_name VARCHAR(100) NOT NULL',
@@ -538,7 +554,8 @@ end
 --  }
 -- ═════════════════════════════════════════════════════════════
 local cache = {}
-local products = {}   -- products[job] = lista produktów firmy (osobny cache, bo korzystają z niego inne firmy)
+local products = {}    -- products[job] = lista produktów firmy (osobny cache, bo korzystają z niego inne firmy)
+local productsAt = {}  -- productsAt[job] = czas wczytania (patrz Config.Cache.productsSeconds)
 
 local function newJob()
     return {
@@ -734,7 +751,7 @@ function data.Vehicles(job)
 end
 
 local ORDER_COLS = [[
-    id, kind, buyer_job, supplier_job, items, total, status, note, reason, by_name,
+    id, kind, buyer_job, supplier_job, items, total, status, delivery, note, reason, by_name,
     UNIX_TIMESTAMP(created_at) AS at
 ]]
 
@@ -1213,22 +1230,31 @@ end
 -- ═════════════════════════════════════════════════════════════
 function data.Products(job)
     local list = products[job]
+    local ttl = tonumber(LIM.productsSeconds) or 60
+    -- 0 = cache tylko do najbliższej zmiany w panelu; wartość > 0 sprawia, że poprawki zrobione
+    -- ręcznie w bazie (SQL) też się wczytają, bez restartu zasobu
+    if list and ttl > 0 and (os.time() - (productsAt[job] or 0)) > ttl then list = nil end
+
     if not list then
         list = {}
         local rows = MySQL.query.await('SELECT id, name, category, descr, price, active, access, model, express_fee FROM ' .. T('products') .. ' WHERE job = ? ORDER BY id', { job })
         for _, p in ipairs(rows or {}) do
             list[#list + 1] = {
                 id = p.id, name = p.name, category = p.category or '', desc = p.descr or '',
-                price = p.price, active = p.active == 1, access = p.access and json.decode(p.access) or nil,
-                model = p.model, expressFee = p.express_fee
+                price = p.price, active = flag(p.active), access = decodeJson(p.access, nil),
+                model = p.model, expressFee = tonumber(p.express_fee)
             }
         end
         products[job] = list
+        productsAt[job] = os.time()
     end
     return list
 end
 
-function data.InvalidateProducts(job) products[job] = nil end
+function data.InvalidateProducts(job)
+    products[job] = nil
+    productsAt[job] = nil
+end
 
 -- ── KATALOG POJAZDÓW ─────────────────────────────────────────────────────────
 -- Katalogiem jest oferta firmy-dostawcy pojazdów (Config.VehicleShop.supplierJob).
@@ -1325,7 +1351,7 @@ function data.NewOrder(kind, buyerJob, supplierJob, items, total, by, note)
 
     -- dorzucamy zamówienie do pamięci obu firm (jeśli już wczytana) – bez ponownego SELECT-a
     local row = { id = id, kind = kind, buyer_job = buyerJob, supplier_job = supplierJob, items = items,
-        total = total, status = 'pending', note = note, reason = nil, by_name = by, at = os.time() }
+        total = total, status = 'pending', delivery = nil, note = note, reason = nil, by_name = by, at = os.time() }
 
     local buyerCache = cache[buyerJob]
     if buyerCache and buyerCache.orders.buyerLoaded then table.insert(buyerCache.orders.buyer, 1, row) end
@@ -1338,8 +1364,28 @@ end
 
 -- field = 'buyer_job' albo 'supplier_job'
 function data.GetOrder(id, kind, field, job)
-    return MySQL.single.await(('SELECT id, kind, buyer_job, supplier_job, items, total, status FROM %s \
+    return MySQL.single.await(('SELECT id, kind, buyer_job, supplier_job, items, total, status, delivery FROM %s \
         WHERE id = ? AND %s = ? AND kind = ?'):format(T('orders'), field), { id, job, kind })
+end
+
+-- bez filtra pracy – używa tego fizyczna dostawa pojazdów (nano skrypt CD)
+function data.GetOrderRaw(id, kind)
+    return MySQL.single.await(('SELECT id, kind, buyer_job, supplier_job, items, total, status, delivery FROM %s \
+        WHERE id = ? AND kind = ?'):format(T('orders')), { id, kind })
+end
+
+-- 'physical' = zamówienie pojazdów realizowane lawetą; nil = zwykła dostawa
+function data.SetOrderDelivery(id, value, buyerJob, supplierJob)
+    MySQL.update.await(('UPDATE %s SET delivery = ? WHERE id = ?'):format(T('orders')), { value, id })
+
+    for _, target in ipairs({ buyerJob, supplierJob }) do
+        local c = target and cache[target]
+        if c then
+            for _, list in ipairs({ c.orders.buyer, c.orders.supplier }) do
+                for _, order in ipairs(list) do if order.id == id then order.delivery = value end end
+            end
+        end
+    end
 end
 
 function data.SetOrderStatus(id, field, job, from, to, reason, buyerJob, supplierJob)
@@ -1393,24 +1439,151 @@ function data.SetVehicleOwner(job, plate, identifier, ssn)
     end
 end
 
--- ── wpis w owned_vehicles (ESX) ──
+-- ── wpis w `owned_vehicles` (garaż) ─────────────────────────────────────────
+--  UWAGA: nazwy kolumn w tej tabeli różnią się między wersjami skryptów garażu:
+--    • klasyczne ESX:  owner, plate, vehicle, type, stored
+--    • polskie edycje: owner, vehicle, owner_type, state, plate, vehicleid, ZlomTime,
+--                      typ, glovebox, trunk, fakeplate, garage, ssn, vin, isPolice, mileage, cansell
+--  Dlatego nie wpisujemy niczego na sztywno: przy pierwszym użyciu czytamy strukturę tabeli
+--  (SHOW COLUMNS) i budujemy INSERT wyłącznie z kolumn, które naprawdę istnieją. Kolumny z wartością
+--  domyślną (state, isPolice, mileage, cansell, owner_type, typ…) zostawiamy bazie.
 local function vehicleCfg() return Config.VehicleShop.ownedVehicles end
+
+local ov = { cols = nil, modelStyle = nil }    -- cache: struktura tabeli + format modelu w istniejących wpisach
+
+local function ovTable()
+    local cfg = vehicleCfg()
+    return (cfg and cfg.table) or 'owned_vehicles'
+end
+
+local function ovPick(cols, list)
+    for _, name in ipairs(list or {}) do if cols[name] then return name end end
+    return nil
+end
+
+local function ovColumns()
+    if ov.cols then return ov.cols end
+    ov.cols = {}
+    local ok, rows = pcall(function() return MySQL.query.await('SHOW COLUMNS FROM `' .. ovTable() .. '`') end)
+    if ok and type(rows) == 'table' then
+        for _, r in ipairs(rows) do
+            local name = r and (r.Field or r.field)
+            if name then
+                ov.cols[name] = {
+                    null    = (r.Null or r.null) == 'YES',
+                    default = (r.Default ~= nil) and r.Default or r.default,
+                    extra   = tostring(r.Extra or r.extra or '')
+                }
+            end
+        end
+    else
+        print(('^1[crp_bossmenu] nie mogłem odczytać struktury tabeli `%s` – wpis do garażu pominięty^7'):format(ovTable()))
+    end
+    return ov.cols
+end
+
+-- zresetuj cache, gdy zmienisz tabelę/nazwy kolumn w configu (albo po edycji struktury w bazie)
+function data.InvalidateVehicleSchema()
+    ov.cols, ov.modelStyle = nil, nil
+end
+
+-- format zapisu modelu bierzemy z tego, co już jest w bazie (hash/liczba czy nazwa modelu)
+local function ovModelValue(model)
+    local cfg = vehicleCfg()
+    local style = cfg.modelFormat
+    if style == 'auto' or style == nil then
+        if ov.modelStyle == nil then
+            ov.modelStyle = 'hash'
+            local ok, row = pcall(function()
+                return MySQL.single.await(('SELECT vehicle FROM `%s` WHERE vehicle IS NOT NULL AND vehicle <> "" LIMIT 1'):format(ovTable()))
+            end)
+            local raw = (ok and type(row) == 'table') and (row.vehicle or row.VEHICLE) or nil
+            if raw then
+                local decoded = select(2, pcall(json.decode, raw))
+                if type(decoded) == 'table' and decoded.model ~= nil then
+                    ov.modelStyle = (type(decoded.model) == 'string') and 'string' or 'hash'
+                    print(('^2[crp_bossmenu]^7 owned_vehicles: model zapisuję jak w istniejących wpisach (%s)'):format(ov.modelStyle))
+                end
+            else
+                print('^3[crp_bossmenu]^7 owned_vehicles: brak innych pojazdów do porównania – zapisuję model jako hash. '
+                    .. 'Jeśli auto nie pojawi się w garażu, ustaw Config.VehicleShop.ownedVehicles.modelFormat = "string"')
+            end
+        end
+        style = ov.modelStyle
+    end
+    if style == 'string' then return model end
+    return GetHashKey(model)
+end
+
+-- 17 znaków: litery (bez I, O, Q) + cyfry – taki sam zestaw jak w prawdziwym VIN
+local function ovVin()
+    local chars = 'ABCDEFGHJKLMNPRSTUVWXYZ0123456789'
+    local t = {}
+    for i = 1, 17 do local n = math.random(#chars); t[i] = chars:sub(n, n) end
+    return table.concat(t)
+end
 
 function data.GrantVehicle(job, plate, model)
     local cfg = vehicleCfg()
     if not cfg.enabled then return end
+
+    local cols = ovColumns()
+    if not next(cols) then return end          -- brak tabeli/uprawnień – nie sypiemy błędami w pętli
+
+    local c = cfg.columns or {}
+    local fields, params, used = {}, {}, {}
+    local function set(name, value)
+        if not name or used[name] or not cols[name] or value == nil then return end
+        used[name] = true
+        fields[#fields + 1] = '`' .. name .. '`'
+        params[#params + 1] = value
+    end
+
+    set(ovPick(cols, c.owner or { 'owner' }), cfg.owner(job, nil))
+    set(ovPick(cols, c.plate or { 'plate' }), plate)
+    set(ovPick(cols, c.vehicle or { 'vehicle' }), json.encode({ model = ovModelValue(model), plate = plate }))
+    set(ovPick(cols, c.type or { 'typ', 'type' }), cfg.type)
+    set(ovPick(cols, c.stored or { 'stored' }), 1)
+
+    -- dodatkowe kolumny z configu (np. isPolice = 1, state = 3, garage = 1)
+    for name, value in pairs(cfg.extra or {}) do
+        set(name, type(value) == 'function' and value(job, plate, model) or value)
+    end
+
+    -- kolumny wymagane (NOT NULL bez wartości domyślnej), których jeszcze nie ustawiliśmy:
+    -- `vin` umiemy wygenerować, o pozostałych mówimy wprost w konsoli
+    local missing = {}
+    for name, def in pairs(cols) do
+        if not used[name] and not def.null and def.default == nil and not def.extra:find('auto_increment') then
+            if name == ovPick(cols, c.vin or { 'vin' }) and cfg.vin ~= '' then set(name, cfg.vin or ovVin())
+            else missing[#missing + 1] = name end
+        end
+    end
+    if #missing > 0 then
+        table.sort(missing)
+        print(('^1[crp_bossmenu] tabela `%s` wymaga kolumn bez wartości domyślnej: %s – dopisz je w Config.VehicleShop.ownedVehicles.extra (np. extra = { %s = 1 }), inaczej pojazd nie trafi do garażu^7')
+            :format(ovTable(), table.concat(missing, ', '), missing[1]))
+        return
+    end
+
+    local marks = {}
+    for i = 1, #fields do marks[i] = '?' end
+
     local ok, err = pcall(function()
-        MySQL.insert.await('INSERT INTO owned_vehicles (owner, plate, vehicle, type, stored) VALUES (?, ?, ?, ?, 1)',
-            { cfg.owner(job, nil), plate, json.encode({ model = GetHashKey(model), plate = plate }), cfg.type })
+        MySQL.insert.await(('INSERT INTO `%s` (%s) VALUES (%s)'):format(ovTable(), table.concat(fields, ', '), table.concat(marks, ', ')), params)
     end)
-    if not ok then print('^1[crp_bossmenu] owned_vehicles:^7', err) end
+    if not ok then
+        print('^1[crp_bossmenu] owned_vehicles:^7', err)
+    elseif cfg.debug then
+        print(('^2[crp_bossmenu]^7 %s (%s) → %s (%s)'):format(model, plate, ovTable(), table.concat(fields, ', ')))
+    end
 end
 
 function data.VehicleOwner(job, plate, identifier)
     local cfg = vehicleCfg()
     if not cfg.enabled then return end
     pcall(function()
-        MySQL.update.await('UPDATE owned_vehicles SET owner = ? WHERE plate = ?', { cfg.owner(job, identifier), plate })
+        MySQL.update.await(('UPDATE `%s` SET owner = ? WHERE plate = ?'):format(ovTable()), { cfg.owner(job, identifier), plate })
     end)
 end
 
@@ -1422,7 +1595,7 @@ function data.NewPlate()
 
         local taken = MySQL.scalar.await('SELECT 1 FROM ' .. T('vehicles') .. ' WHERE plate = ?', { plate })
         if not taken then
-            local ok, r = pcall(function() return MySQL.scalar.await('SELECT 1 FROM owned_vehicles WHERE plate = ?', { plate }) end)
+            local ok, r = pcall(function() return MySQL.scalar.await(('SELECT 1 FROM `%s` WHERE plate = ?'):format(ovTable()), { plate }) end)
             if not ok or not r then return plate end
         end
     end
@@ -1433,15 +1606,39 @@ end
 -- ═════════════════════════════════════════════════════════════
 --  PACZKA DLA UI (to leci do klienta przy otwarciu i odświeżeniu)
 -- ═════════════════════════════════════════════════════════════
+-- ── dopasowanie gracza do listy pracowników ─────────────────────────────────
+--  Gracz online pokazuje się TYLKO na liście pracy, w której aktualnie pracuje –
+--  ale „aktualnie” liczymy przez baseJob (offpolice → police), bo inaczej osoba
+--  po zejściu ze służby znikała ze wszystkich list naraz.
+--  Gdy ma inną pracę z naszego configu, pokazujemy ją jako plakietkę (Config.ShowOtherJobs).
+local function playerJob(x)
+    local name = x and x.job and x.job.name
+    if type(name) ~= 'string' or name == '' then return nil end
+    if Config.Jobs[name] then return name end
+    if Config.AllowOffDuty == false then return name end
+    local stripped = name:gsub('^off', '')
+    if stripped ~= name and Config.Jobs[stripped] then return stripped end
+    return name
+end
+
+--  nil = osoba nie pasuje do tej listy, '' = pasuje, 'Nazwa pracy' = pracuje gdzie indziej
+local function jobMismatch(cur, job)
+    if not cur or cur == job then return '' end
+    if Config.ShowOtherJobs ~= false and Config.Jobs[cur] then return data.JobLabel(cur) end
+    return nil
+end
+
 local function buildEmployee(c, job, identifier, u, granted)
     local m = c.members[identifier]
 
-    -- gracz online ma zawsze aktualny stopień/status i nie pokazujemy go, jeśli zmienił pracę
-    local grade, status = u.grade, 'off'
+    -- gracz online ma zawsze aktualny stopień/status; osoba pracująca gdzie indziej dostaje plakietkę
+    local grade, status, otherJob = u.grade, 'off', nil
     local x = ESX.GetPlayerFromIdentifier(identifier)
     if x then
-        if x.job.name ~= job then return nil end
-        grade, status = x.job.grade, Config.GetDutyStatus(x.source, x)
+        local other = jobMismatch(playerJob(x), job)
+        if other == nil then return nil end          -- inna/nieznana praca → nie należy do tej listy
+        otherJob = other ~= '' and other or nil
+        grade, status = x.job.grade, otherJob and 'off' or Config.GetDutyStatus(x.source, x)
     end
 
     local seconds  = m and m.seconds or 0
@@ -1458,6 +1655,7 @@ local function buildEmployee(c, job, identifier, u, granted)
         badge       = m and m.badge ~= nil and tonumber(m.badge) or nil,
         hiredAt     = asDate((m and m.hired_at) or os.time()),
         hoursWeek   = secondsToHours(seconds),
+        otherJob    = otherJob,                        -- 'Nazwa pracy', gdy aktualnie pracuje gdzie indziej
         licenses    = {}, records = {}, promotions = {}
     }
 
@@ -1496,7 +1694,8 @@ local function orderRow(r, view)
     local o = {
         id = (r.kind == 'vehicles' and 'ord-' or 'zam-') .. r.id,
         kind = r.kind, items = r.items, total = r.total,
-        by = r.by_name, at = asDateTime(r.at), status = r.status
+        by = r.by_name, at = asDateTime(r.at), status = r.status,
+        delivery = r.delivery                 -- 'physical' = dostawa lawetą (nano skrypt CD)
     }
     if r.kind == 'vehicles' then
         o.note, o.reason = r.reason, r.reason          -- garaż pokazuje powód odrzucenia jako note
@@ -1517,6 +1716,63 @@ local function hasAccess(access, job)
 end
 
 function data.HasAccess(product, job) return hasAccess(product.access, job) end
+
+-- ── podgląd listy pracowników innych prac (Config.ViewJobs / Config.Jobs[job].viewJobs) ──
+--  Tylko do czytania: bez licencji, wpisów i awansów (te należą do ich własnej firmy).
+local function buildRelated(x, job)
+    local grade, status, otherJob = x.grade, 'off', nil
+    local p = ESX.GetPlayerFromIdentifier(x.identifier)
+    if p then
+        local other = jobMismatch(playerJob(p), job)
+        if other == nil then return nil end
+        otherJob = other ~= '' and other or nil
+        grade, status = p.job.grade, otherJob and 'off' or Config.GetDutyStatus(p.source, p)
+    end
+
+    local m = data.Member(job, x.identifier)
+    return {
+        ssn = asText(x.ssn) or x.identifier, firstname = x.firstname or '', lastname = x.lastname or '',
+        phonenumber = x.phone and asText(x.phone) or '', grade = tonumber(grade) or 0, status = status,
+        otherJob = otherJob, online = p ~= nil,
+        hoursWeek = secondsToHours(m and m.seconds or 0),
+        hiredAt = asDate((m and m.hired_at) or os.time())
+    }
+end
+
+-- lista prac, które ta praca może podglądać: { { job, label }, ... }
+function data.ViewJobList(job)
+    local jc = Config.Jobs[job] or {}
+    local map = Config.ViewJobs and Config.ViewJobs[job]
+    if not map and type(jc.viewJobs) == 'table' then map = jc.viewJobs end
+
+    local out = {}
+    if type(map) == 'table' then
+        for other, on in pairs(map) do
+            if on and other ~= job and Config.Jobs[other] then
+                out[#out + 1] = { job = other, label = data.JobLabel(other) }
+            end
+        end
+    end
+    table.sort(out, function(a, b) return a.label < b.label end)
+    return out
+end
+
+local function buildRelatedGroups(job)
+    local groups = {}
+    for _, def in ipairs(data.ViewJobList(job)) do
+        local list = {}
+        for _, x in pairs(data.Roster(def.job)) do
+            local e = buildRelated(x, def.job)
+            if e then list[#list + 1] = e end
+        end
+        table.sort(list, function(a, b)
+            if a.grade ~= b.grade then return a.grade > b.grade end
+            return (a.lastname .. a.firstname) < (b.lastname .. b.firstname)
+        end)
+        groups[#groups + 1] = { job = def.job, label = def.label, employees = list }
+    end
+    return groups
+end
 
 function data.Build(s)
     local job, jc = s.job, Config.Jobs[s.job]
@@ -1560,7 +1816,10 @@ function data.Build(s)
             if otherCfg.supplier then
                 local list = {}
                 for _, p in ipairs(data.Products(other)) do
-                    if p.active and hasAccess(p.access, job) then list[#list + 1] = p end
+                    -- pozycje z modelem pojazdu obsługuje Garaż (katalog), nie zamówienia towarowe
+                    if p.active and hasAccess(p.access, job) and not (p.model and p.model ~= '') then
+                        list[#list + 1] = p
+                    end
                 end
                 if #list > 0 then
                     suppliers[#suppliers + 1] = { job = other, label = data.JobLabel(other), desc = otherCfg.supplierDesc or '', products = list }
@@ -1604,11 +1863,14 @@ function data.Build(s)
         salaryMax   = jc.salaryMax,
         webhooks    = c.webhooks,
         employees   = employees,
+        related     = buildRelatedGroups(job),        -- listy innych prac (tylko do czytania)
+        maxPrice    = (Config.Goods and Config.Goods.maxPrice) or 100000000,
         funds       = data.Funds(job),
         transactions = transactions,
         history     = history,
         supplier    = job ~= Config.VehicleShop.supplierJob and data.JobLabel(Config.VehicleShop.supplierJob) or '',
         expressFee  = Config.VehicleShop.expressFee,      -- domyślna dopłata, gdy produkt nie ma własnej
+        goodsExpressFee = (Config.Goods and Config.Goods.expressFee) or 0,   -- to samo dla zamówień towarowych
         vehicleSupplier = job == Config.VehicleShop.supplierJob,
         catalog     = catalog,
         vehicles    = vehicles,

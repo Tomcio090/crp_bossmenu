@@ -17,8 +17,23 @@ local Config = {}
 -- ─────────────────────────────────────────────────────────────
 Config.Command         = 'bossmenu'   -- komenda otwierająca panel (false = wyłączona)
 Config.RequireLocation = false        -- true = panel tylko stojąc przy punkcie z Config.Locations
+Config.AllowOffDuty    = true         -- true = panel działa też na pracy „off<job>” (offpolice, offambulance…),
+                                      --        false = tylko na służbie (wtedy duty/off-job zamyka panel)
 Config.Debug           = false        -- podświetlanie stref ox_target
+Config.ShowOtherJobs   = true         -- true = w liście pracowników widać też osoby zatrudnione w tej firmie,
+                                      --        ale aktualnie pracujące gdzie indziej (z plakietką „Inna praca: X”)
 Config.PlayerAccount   = 'bank'       -- konto gracza przy wpłatach/wypłatach: 'bank' | 'money'
+
+-- ─────────────────────────────────────────────────────────────
+--  KRZESŁO / PANEL – blokada „jedna osoba naraz”
+--  Panel pilnuje serwer: drugi gracz dostanie komunikat, kto go używa.
+-- ─────────────────────────────────────────────────────────────
+Config.Panel = {
+    singleUser      = true,    -- false = wyłącza blokady (dwóch graczy może używać panelu równocześnie)
+    seatTimeout     = 1800,    -- po ilu sekundach od zajęcia krzesła blokada wygasa (0 = nigdy)
+    releaseDistance = 10.0,    -- gdy zajmujący odejdzie dalej niż X m od krzesła, blokada wraca do puli
+    animRange       = 60.0     -- w jakim promieniu inni gracze widzą animację siedzenia
+}
 
 -- ─────────────────────────────────────────────────────────────
 --  BAZA DANYCH – nazwy kolumn w tabeli graczy (ESX: users)
@@ -57,7 +72,8 @@ Config.Cache = {
     refreshSeconds = 30,    -- co ile sekund odświeżać otwarty panel (0 = tylko po akcjach)
     logLimit       = 300,   -- ile ostatnich wpisów historii / transakcji trzymać
     orderLimit     = 150,   -- ile ostatnich zamówień trzymać
-    recordLimit    = 3000   -- ile wpisów dyscyplinarnych / awansów wczytać na firmę
+    recordLimit    = 3000,  -- ile wpisów dyscyplinarnych / awansów wczytać na firmę
+    productsSeconds = 60    -- co ile sekund odświeżać cache oferty (0 = tylko po zmianach w panelu)
 }
 
 -- ─────────────────────────────────────────────────────────────
@@ -97,6 +113,8 @@ Config.Jobs = {
         }
     },
 
+    -- UWAGA: nazwa musi być identyczna z pracą w ESX. duty/wardrobe używają `ambulance` –
+    -- jeśli u Ciebie pogotowie to `ambulance`, zmień klucz `ems` na `ambulance`.
     ems = {
         salaryMax = 180,
         features  = { licenses = true, badges = true, records = true },
@@ -128,6 +146,35 @@ Config.Jobs = {
 --  PUNKTY PANELU (strefa ox_target + krzesło z animacją)
 --  Wartości mcoords / bossmenucoords / chaircoords możesz podejrzeć w Config.Debug = true
 -- ─────────────────────────────────────────────────────────────
+    -- ── PRZYKŁADY na Twój przypadek (odkomentuj, jeśli masz takie prace w ESX) ──
+    -- Praca „law” widzi listę policji i szeryfa – szczegóły ustawia się w Config.ViewJobs poniżej.
+    --['law'] = {
+    --    minGrade = 0,
+    --    salaryMax = 250,
+    --    features  = { licenses = true, badges = true, records = true },
+    --    licenses  = {},
+    --    viewJobs  = { police = true, sheriff = true }      -- to samo co w Config.ViewJobs.law
+    --},
+    --['sheriff'] = {
+    --    minGrade = 0,
+    --    salaryMax = 180,
+    --    features  = { licenses = true, badges = true, records = true },
+    --    licenses  = {}
+    --},
+
+-- ─────────────────────────────────────────────────────────────
+--  PODGLĄD LISTY PRACOWNIKÓW INNYCH PRAC (tylko do czytania)
+--
+--  Praca po lewej widzi listę pracowników z prac po prawej – bez możliwości
+--  zatrudniania, zwalniania czy zmiany stopnia (to nadal robi tylko ich własna firma).
+--  Przykład z życia: praca „law” widzi listę policji i szeryfa.
+-- ─────────────────────────────────────────────────────────────
+Config.ViewJobs = {
+    --['law'] = { police = true, sheriff = true },
+    --['police'] = { sheriff = true },          -- policja widzi szeryfów
+    --['sheriff'] = { police = true },          -- i odwrotnie
+}
+
 Config.Locations = {
     ['mrpd'] = {
         job            = 'centra_autos',
@@ -136,22 +183,26 @@ Config.Locations = {
         bossmenucoords = vec4(461.5347, -986.2550, 30.6604, 180.0223), -- strefa ox_target „Otwórz Boss Menu”
         chaircoords    = vec4(461.7296, -985.3137, 30.4, 305.0)        -- gdzie spawnuje się krzesło
     },
-    ['mrpd1'] = {
-        job            = 'police',
-        mcoords        = vec4(461.4712, -987.8772, 31.2, 0.4353),      -- środek punktu
-        distance       = 20.0,                                         -- z jakiej odległości punkt się aktywuje
-        bossmenucoords = vec4(461.5347, -986.2550, 30.6604, 180.0223), -- strefa ox_target „Otwórz Boss Menu”
-        chaircoords    = vec4(461.7296, -985.3137, 30.4, 305.0)        -- gdzie spawnuje się krzesło
-    }
 
-    -- Przykład drugiego punktu:
-    -- ['mechanic'] = {
-    --     job            = 'mechanic',
-    --     mcoords        = vec4(-347.1, -133.4, 39.0, 0.0),
-    --     distance       = 20.0,
-    --     bossmenucoords = vec4(-347.1, -133.4, 39.0, 0.0),
-    --     chaircoords    = vec4(-348.2, -134.1, 38.6, 90.0)
-    -- }
+    -- UWAGA: wpis 'mrpd1' (policja) miał IDENTYCZNE współrzędne co 'mrpd' (centra_autos), przez co
+    -- w jednym miejscu pojawiały się dwa krzesła i dwie strefy ox_target. Wstaw własne współrzędne,
+    -- jeśli chcesz osobny punkt dla policji:
+    --['mrpd1'] = {
+    --    job            = 'police',
+    --    mcoords        = vec4(441.5, -982.5, 30.7, 0.0),
+    --    distance       = 20.0,
+    --    bossmenucoords = vec4(441.5, -982.5, 30.7, 0.0),
+    --    chaircoords    = vec4(442.3, -983.1, 30.4, 90.0)
+    --}
+
+    -- Punkt dla kilku prac naraz: zamiast `job` podaj `jobs` (klucz = praca, wartość = minimalny stopień).
+    --['office'] = {
+    --    jobs           = { police = 10, mechanic = 4 },
+    --    mcoords        = vec4(-347.1, -133.4, 39.0, 0.0),
+    --    distance       = 20.0,
+    --    bossmenucoords = vec4(-347.1, -133.4, 39.0, 0.0),
+    --    chaircoords    = vec4(-348.2, -134.1, 38.6, 90.0)
+    --}
 }
 
 -- ─────────────────────────────────────────────────────────────
@@ -165,12 +216,47 @@ Config.VehicleShop = {
     -- Katalogiem pojazdów zarządza firma-dostawca w panelu (zakładka Oferta):
     -- dodaje pojazdy (model + nazwa + cena), ustawia widoczność i dopłatę za szybki transport.
     -- Uwaga: `supplierJob` musi być pracą, która naprawdę istnieje w ESX (tu: centra_autos).
+    -- ── DOSTAWA POJAZDÓW „NA ŻYWO” (gdy kupujący NIE wybrał szybkiego transportu) ──
+    --  Obsługuje ją osobny zasób (nano skrypt `nano_cd`, w przyszłości własny skrypt CD).
+    --  bossmenu tylko przekazuje mu zamówienie i odbiera potwierdzenie oddania aut.
+    --  Gdy zasób nie jest uruchomiony, wszystko działa po staremu (auta od razu w garażu).
+    delivery = {
+        resource       = 'nano_cd',                   -- nazwa zasobu obsługującego dostawę ('' = wyłączone)
+        event          = 'crp_cd:server:start',       -- event startu zadania (bossmenu → zasób CD)
+        cancelEvent    = 'crp_cd:server:cancel',      -- event anulowania zadania
+        resendEvent    = 'crp_cd:server:resend',      -- event ponownego wysłania zadań (np. po restarcie CD)
+        manualOverride = false                        -- true = panel może „Dostarczono” nawet przy dostawie fizycznej
+    },
+
     cartMax     = 10,         -- maks. pozycji w koszyku
     plateFormat = 'AAA 000',  -- A = litera, 0 = cyfra (max 8 znaków w ESX)
+    -- ── wpis w tabeli `owned_vehicles` (garaż gracza/firmy) ────────────────────────────
+    --  Zasób NIE wpisuje nazw kolumn na sztywno: przy pierwszym użyciu czyta strukturę tabeli
+    --  (SHOW COLUMNS) i wstawia tylko kolumny, które naprawdę istnieją. Dzięki temu działa i na
+    --  klasycznym ESX (`type`, `stored`), i na polskich edycjach (`typ`, `vin`, `state`, `owner_type`…).
+    --  Kolumny mające wartość domyślną (state, isPolice, mileage, cansell, owner_type) zostają
+    --  na wartościach z bazy – chyba że wypiszesz je w `extra`.
     ownedVehicles = {
         enabled = true,
-        type    = 'car',
-        -- właściciel wpisu w owned_vehicles: pracownik, któremu przydzielono auto, albo konto firmy
+        table   = 'owned_vehicles',
+        type    = 'car',          -- wartość kolumny typu (`typ` w nowszych bazach, `type` w klasycznym ESX)
+
+        -- 'auto'  = tak, jak jest zapisane w innych pojazdach w bazie (zalecane),
+        -- 'hash'  = liczba (GetHashKey), 'string' = nazwa modelu, np. "stanier"
+        modelFormat = 'auto',
+        vin     = nil,            -- nil = wygeneruj 17 znaków, gdy tabela wymaga kolumny `vin`; '' = pomiń
+        debug   = false,          -- true = wypisze w konsoli, co dokładnie poszło do owned_vehicles
+
+        -- nazwy kolumn w Twojej tabeli (pierwsza istniejąca wygrywa) – podmień, jeśli masz inne
+        columns = {
+            owner = { 'owner' }, plate = { 'plate' }, vehicle = { 'vehicle' },
+            type = { 'typ', 'type' }, stored = { 'stored' }, vin = { 'vin' }
+        },
+        -- kolumny, których nie da się wywnioskować (np. flaga garażu policyjnego, stan, numer garażu)
+        -- np.: extra = { isPolice = 1, state = 3, garage = 1 }
+        extra = {},
+
+        -- właściciel wpisu: pracownik, któremu przydzielono auto, albo konto firmy
         owner   = function(job, identifier) return identifier or ('society:' .. job) end
     },
     seedCatalog = false,      -- jednorazowe przeniesienie listy niżej do oferty dostawcy; false = katalog robisz sam w panelu
@@ -187,7 +273,12 @@ Config.VehicleShop = {
 Config.Goods = {
     maxLines = 20,       -- maks. pozycji w zamówieniu
     maxQty   = 99,       -- maks. sztuk jednej pozycji
-    maxPrice = 1000000   -- maks. cena produktu w ofercie
+    maxPrice = 100000000, -- maks. cena produktu/dopłaty w ofercie (9 cyfr – wcześniej 1 000 000, czyli 7)
+
+    -- Szybki transport towarów (B2B). Dopłatę za sztukę ustawia dostawca na produkcie
+    -- (Oferta → produkt → „Szybki transport (za sztukę)”), a kupujący zaznacza ją w koszyku.
+    -- Poniższa wartość to tylko domyślna kwota, gdy produkt nie ma własnej: 0 = brak domyślnej.
+    expressFee = 0
 }
 
 -- ─────────────────────────────────────────────────────────────

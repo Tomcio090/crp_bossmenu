@@ -1,5 +1,5 @@
 return {
-    wardrobeDebug = true,
+    wardrobeDebug = false,   -- true = podświetlenie stref ox_target (klient czytał wcześniej nieistniejące `dutyDebug`)
     locations = {
         ['mrpd'] = {
             job = 'police',

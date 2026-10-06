@@ -1,25 +1,68 @@
 local ESX = exports["es_extended"]:getSharedObject()
 local data = require('resources.wardrobe.d_wardrobe')
 local clothes = {}
+local TABLE_NAME = 'crp_jobcore_wardrobe'
 
-local function HasPlayerLicense(source, licenseName)
-    local xPlayer = ESX.GetPlayerFromId(source)
-    if not xPlayer then return false end
+-- Tabela strojów nie jest zakładana w żadnym innym miejscu (bossmenu.sql jest pustym eksportem),
+-- więc tworzymy ją idempotentnie przy starcie.
+MySQL.ready(function()
+    MySQL.query.await(([[
+        CREATE TABLE IF NOT EXISTS `%s` (
+            `id` INT AUTO_INCREMENT PRIMARY KEY,
+            `components` LONGTEXT NULL,
+            `props` LONGTEXT NULL,
+            `pedmodel` VARCHAR(50) NULL,
+            `job` VARCHAR(50) NOT NULL,
+            `clothesName` VARCHAR(100) NOT NULL,
+            `grades` TEXT NULL,
+            `licenses` TEXT NULL,
+            INDEX `idx_job` (`job`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+    ]]):format(TABLE_NAME))
+end)
 
-    local hasLicense = false
-    MySQL.Sync.fetchAll('SELECT * FROM user_licenses WHERE owner = ? AND type = ?', {
-        xPlayer.identifier, licenseName
-    }, function(result)
-        if result and #result > 0 then
-            hasLicense = true
-        end
-    end)
+-- JSON z bazy bez wywalania loadera (ręcznie wpisane / niepełne dane)
+local function decode(value, fallback)
+    if type(value) ~= 'string' or value == '' then return fallback end
+    local ok, decoded = pcall(json.decode, value)
+    if not ok or type(decoded) ~= 'table' then return fallback end
+    return decoded
+end
 
-    return hasLicense
+-- Punkt w d_wardrobe.locations jest kluczowany np. 'mrpd', a nie nazwą pracy – szukamy po `job`.
+local function jobConfig(job)
+    for _, loc in pairs(data.locations or {}) do
+        if loc.job and tostring(loc.job):lower() == tostring(job):lower() then return loc end
+    end
+end
+
+-- Czy gracz ma stopień wymagany do zarządzania szatnią swojej pracy
+local function canManage(xPlayer)
+    local cfg = jobConfig(xPlayer.job.name)
+    if not cfg then return false end
+    return xPlayer.job.grade >= (cfg.requiredGrade or 0)
+end
+
+local function sameGrade(list, grade)
+    for _, value in ipairs(list or {}) do
+        if tostring(value) == tostring(grade) then return true end
+    end
+    return false
+end
+
+-- oxmysql udostępnia `MySQL.scalar.await` (zwraca wynik). Poprzednia wersja wołała
+-- MySQL.Sync.fetchAll z callbackiem, który NIGDY się nie wykonywał – licencje zawsze wychodziły „brak”.
+local function hasLicenses(xPlayer, list)
+    for _, license in ipairs(list or {}) do
+        local found = MySQL.scalar.await('SELECT 1 FROM user_licenses WHERE owner = ? AND type = ? LIMIT 1',
+            { xPlayer.identifier, license })
+        if not found then return false end
+    end
+    return true
 end
 
 CreateThread(function()
-    local response = MySQL.query.await('SELECT `id`, `components`, `props`, `pedmodel`, `job`, `clothesName`, `grades`, `licenses` FROM `crp_jobcore_wardrobe`')
+    local response = MySQL.query.await(('SELECT `id`, `components`, `props`, `pedmodel`, `job`, `clothesName`, `grades`, `licenses` FROM `%s`'):format(TABLE_NAME))
     if not response then return end
 
     for _, v in ipairs(response) do
@@ -28,10 +71,10 @@ CreateThread(function()
             id = v.id,
             clothesName = v.clothesName,
             pedmodel = v.pedmodel,
-            grades = type(v.grades) == 'string' and json.decode(v.grades) or v.grades,
-            licenses = type(v.licenses) == 'string' and json.decode(v.licenses) or v.licenses,
-            components = type(v.components) == 'string' and json.decode(v.components) or v.components,
-            props = type(v.props) == 'string' and json.decode(v.props) or v.props
+            grades = decode(v.grades, {}),
+            licenses = decode(v.licenses, {}),
+            components = decode(v.components, {}),
+            props = decode(v.props, {})
         })
     end
 end)
@@ -41,25 +84,33 @@ lib.callback.register('crp_jobcore:server:getJobs', function(source)
 end)
 
 lib.callback.register('crp_jobcore:server:sendClothesInfo', function(source, components, props, pedmodel, pJob, clothesName, grades, licenses)
-    if not source or not components or not props or not pedmodel or not pJob or not clothesName or not grades then 
+    if not source or not components or not props or not pedmodel or not clothesName or not grades then
         return false
     end
 
+    local xPlayer = ESX.GetPlayerFromId(source)
+    if not xPlayer then return false end
+
+    -- Pracę bierzemy z serwera – wcześniej `pJob` przychodził z klienta, więc można było
+    -- dodać strój dowolnej firmie. Pilnujemy też progu stopnia z d_wardrobe.
+    local job = xPlayer.job.name
+    if not canManage(xPlayer) then return false end
+
     licenses = licenses or {}
 
-    local id = MySQL.insert.await('INSERT INTO `crp_jobcore_wardrobe` (components, props, pedmodel, job, clothesName, grades, licenses) VALUES (?, ?, ?, ?, ?, ?, ?)', {
+    local id = MySQL.insert.await(('INSERT INTO `%s` (components, props, pedmodel, job, clothesName, grades, licenses) VALUES (?, ?, ?, ?, ?, ?, ?)'):format(TABLE_NAME), {
         json.encode(components),
         json.encode(props),
         pedmodel,
-        pJob,
+        job,
         clothesName,
         json.encode(grades),
         json.encode(licenses)
     })
 
     if id and id > 0 then
-        if not clothes[pJob] then clothes[pJob] = {} end
-        table.insert(clothes[pJob], {
+        if not clothes[job] then clothes[job] = {} end
+        table.insert(clothes[job], {
             id = id,
             clothesName = clothesName,
             pedmodel = pedmodel,
@@ -83,24 +134,47 @@ lib.callback.register('crp_jobcore:server:getAllClothesForJob', function(source)
     return clothes[playerJob] or {}
 end)
 
+-- Wspólna weryfikacja: gracz rusza tylko stroje SWOJEJ pracy i tylko od progu stopnia.
+local function ownedOutfit(source, id)
+    local xPlayer = ESX.GetPlayerFromId(source)
+    if not xPlayer then return nil end
+
+    local job = xPlayer.job.name
+    if not canManage(xPlayer) then return nil end
+
+    local row = MySQL.single.await(('SELECT `id`, `job` FROM `%s` WHERE `id` = ?'):format(TABLE_NAME), { id })
+    if not row or row.job ~= job then return nil end
+
+    return { xPlayer = xPlayer, job = job, id = row.id }
+end
+
 lib.callback.register('crp_jobcore:server:updateOutfitMeta', function(source, id, newName, newGrades, newLicenses)
     if not source or not id or not newName or not newGrades then return false end
-    local xPlayer = ESX.GetPlayerFromId(source)
-    if not xPlayer then return false end
+
+    local ctx = ownedOutfit(source, id)
+    if not ctx then return false end
 
     newLicenses = newLicenses or {}
 
-    local affectedRows = MySQL.update.await('UPDATE `crp_jobcore_wardrobe` SET `clothesName` = ?, `grades` = ?, `licenses` = ? WHERE `id` = ?', {
+    -- licencje muszą pochodzić z listy dopuszczonej dla tej pracy (nie dowolny tekst z klienta)
+    local allowed = {}
+    for _, def in ipairs((jobConfig(ctx.job) or {}).licenses or {}) do allowed[tostring(def.value)] = true end
+    for _, license in ipairs(newLicenses) do
+        if not allowed[tostring(license)] then return false end
+    end
+
+    local affectedRows = MySQL.update.await(('UPDATE `%s` SET `clothesName` = ?, `grades` = ?, `licenses` = ? WHERE `id` = ? AND `job` = ?'):format(TABLE_NAME), {
         newName,
         json.encode(newGrades),
         json.encode(newLicenses),
-        id
+        id,
+        ctx.job
     })
 
     if affectedRows > 0 then
-        local playerJob = xPlayer.job.name
-        if clothes[playerJob] then
-            for _, outfit in ipairs(clothes[playerJob]) do
+        local list = clothes[ctx.job]
+        if list then
+            for _, outfit in ipairs(list) do
                 if outfit.id == id then
                     outfit.clothesName = newName
                     outfit.grades = newGrades
@@ -117,20 +191,22 @@ end)
 
 lib.callback.register('crp_jobcore:server:updateOutfitAppearance', function(source, id, components, props, pedmodel)
     if not source or not id or not components or not props or not pedmodel then return false end
-    local xPlayer = ESX.GetPlayerFromId(source)
-    if not xPlayer then return false end
 
-    local affectedRows = MySQL.update.await('UPDATE `crp_jobcore_wardrobe` SET `components` = ?, `props` = ?, `pedmodel` = ? WHERE `id` = ?', {
+    local ctx = ownedOutfit(source, id)
+    if not ctx then return false end
+
+    local affectedRows = MySQL.update.await(('UPDATE `%s` SET `components` = ?, `props` = ?, `pedmodel` = ? WHERE `id` = ? AND `job` = ?'):format(TABLE_NAME), {
         json.encode(components),
         json.encode(props),
         pedmodel,
-        id
+        id,
+        ctx.job
     })
 
     if affectedRows > 0 then
-        local playerJob = xPlayer.job.name
-        if clothes[playerJob] then
-            for _, outfit in ipairs(clothes[playerJob]) do
+        local list = clothes[ctx.job]
+        if list then
+            for _, outfit in ipairs(list) do
                 if outfit.id == id then
                     outfit.components = components
                     outfit.props = props
@@ -146,15 +222,20 @@ lib.callback.register('crp_jobcore:server:updateOutfitAppearance', function(sour
 end)
 
 lib.callback.register('crp_jobcore:server:deleteOutfit', function(source, id, jobName)
-    if not source or not id or not jobName then return false end
+    if not source or not id then return false end
 
-    local affectedRows = MySQL.update.await('DELETE FROM `crp_jobcore_wardrobe` WHERE `id` = ?', { id })
+    -- `jobName` z klienta jest ignorowany – pracę bierzemy z serwera i dodajemy warunek AND job = ?
+    local ctx = ownedOutfit(source, id)
+    if not ctx then return false end
+
+    local affectedRows = MySQL.update.await(('DELETE FROM `%s` WHERE `id` = ? AND `job` = ?'):format(TABLE_NAME), { id, ctx.job })
 
     if affectedRows > 0 then
-        if clothes[jobName] then
-            for i, outfit in ipairs(clothes[jobName]) do
+        local list = clothes[ctx.job]
+        if list then
+            for i, outfit in ipairs(list) do
                 if outfit.id == id then
-                    table.remove(clothes[jobName], i)
+                    table.remove(list, i)
                     break
                 end
             end
@@ -170,38 +251,16 @@ lib.callback.register('crp_jobcore:server:getClothesInfo', function(source)
     local xPlayer = ESX.GetPlayerFromId(source)
     if not xPlayer then return {} end
 
-    local playerJob = xPlayer.job.name
-    local playerGrade = tostring(xPlayer.job.grade)
-    local playerPed = GetEntityModel(GetPlayerPed(source))
-
-    local jobClothes = clothes[playerJob]
+    local jobClothes = clothes[xPlayer.job.name]
     if not jobClothes then return {} end
 
     local availableClothes = {}
 
     for _, outfit in ipairs(jobClothes) do
-        local targetPedHash = joaat(outfit.pedmodel)
-        local isPedValid = (playerPed == targetPedHash)
-
-        local isGradeValid = false
-        for _, grade in ipairs(outfit.grades) do
-            if grade == playerGrade then
-                isGradeValid = true
-                break
-            end
-        end
-
-        local hasAllLicenses = true
-        if outfit.licenses and #outfit.licenses > 0 then
-            for _, lic in ipairs(outfit.licenses) do
-                if not HasPlayerLicense(source, lic) then
-                    hasAllLicenses = false
-                    break
-                end
-            end
-        end
-
-        if isPedValid and isGradeValid and hasAllLicenses then
+        -- Stopień i licencje sprawdzamy na serwerze, a MODEL PEDA na kliencie.
+        -- Wcześniej model sprawdzał serwer (GetEntityModel(GetPlayerPed(source))), co dla
+        -- zdalnego gracza zwracało 0 – przez to lista dostępnych ubrań była zawsze pusta.
+        if sameGrade(outfit.grades, xPlayer.job.grade) and hasLicenses(xPlayer, outfit.licenses) then
             table.insert(availableClothes, outfit)
         end
     end

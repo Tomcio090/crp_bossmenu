@@ -47,7 +47,7 @@ CreateThread(function()
             coords = vec3(v.coords.x, v.coords.y, v.coords.z),
             size = vec3(0.5, 0.5, 0.5),
             rotation = v.coords.w,
-            debug = data.dutyDebug,
+            debug = data.wardrobeDebug,
             drawSprite = true,
             options = {
                 {
@@ -145,7 +145,7 @@ CreateThread(function()
                         for index, outfit in ipairs(allJobClothes) do
                             table.insert(options, {
                                 title = outfit.clothesName,
-                                description = 'Model: ' .. outfit.pedmodel .. ' | Kliknij, aby zarządzać.',
+                                description = 'Model: ' .. tostring(outfit.pedmodel or '—') .. ' | Kliknij, aby zarządzać.',
                                 icon = 'shirt',
                                 menu = 'manage_outfit_options_' .. index
                             })
@@ -300,8 +300,20 @@ CreateThread(function()
                             end
                         })
 
-                        if availableClothes and #availableClothes > 0 then
-                            for _, outfit in ipairs(availableClothes) do
+                        -- Model peda sprawdzamy na KLIENCIE – serwer nie zna wiarygodnego modelu gracza
+                        -- (GetEntityModel(GetPlayerPed(source)) zwracało 0, więc lista była zawsze pusta).
+                        local myModel = exports['illenium-appearance']:getPedModel(cache.ped)
+                        local myHash = myModel and joaat(myModel) or 0
+
+                        local usable = {}
+                        for _, outfit in ipairs(availableClothes or {}) do
+                            if not outfit.pedmodel or outfit.pedmodel == '' or (myHash ~= 0 and joaat(outfit.pedmodel) == myHash) then
+                                usable[#usable + 1] = outfit
+                            end
+                        end
+
+                        if #usable > 0 then
+                            for _, outfit in ipairs(usable) do
                                 table.insert(options, {
                                     title = outfit.clothesName,
                                     description = 'Kliknij, aby założyć ten zestaw.',

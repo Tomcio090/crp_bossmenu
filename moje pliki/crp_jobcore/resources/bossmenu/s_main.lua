@@ -76,6 +76,20 @@ end
 
 local function err(msg) return { ok = false, error = msg } end
 
+-- `active TINYINT(1)` wraca z oxmysql raz jako boolean, raz jako 0/1 – patrz s_data.flag()
+local function flag(v) return v == true or v == 1 or v == '1' or v == 'true' end
+
+-- Prace „poza służbą” (offpolice / offambulance – patrz resources/duty) obsługujemy tak samo
+-- jak ich bazowy odpowiednik, żeby szef po zejściu ze służby nie tracił dostępu do panelu.
+local function baseJob(job)
+    if type(job) ~= 'string' or job == '' then return nil end
+    if Config.Jobs[job] then return job end
+    if Config.AllowOffDuty == false then return job end     -- tryb „tylko na służbie”
+    local stripped = job:gsub('^off', '')
+    if stripped ~= job and Config.Jobs[stripped] then return stripped end
+    return job
+end
+
 -- notatka: zostawiamy tylko bezpieczne znaczniki HTML, bez atrybutów
 local ALLOWED_TAGS = { p = 1, br = 1, strong = 1, b = 1, em = 1, i = 1, u = 1, s = 1, h1 = 1, h2 = 1, h3 = 1,
                        ul = 1, ol = 1, li = 1, blockquote = 1 }
@@ -91,6 +105,22 @@ local function sanitizeHtml(html)
     return html:gsub('\1', '<'):gsub('\2', '>')
 end
 
+local function playerSrc(v)
+    if type(v) == 'number' then return (v > 0) and v or nil end
+    if type(v) == 'string' then
+        local n = tonumber(v)
+        return (n and n > 0) and n or nil
+    end
+    return nil
+end
+
+-- nazwa zgłaszającego, gdy nie ma gracza (albo gdy przyszła z obcego zasobu jako tekst/liczba)
+local function whoName(v, fallback)
+    if type(v) == 'string' and v ~= '' then return v end
+    if type(v) == 'number' and v > 0 then return 'gracz #' .. tostring(v) end
+    return fallback or 'System'
+end
+
 local function fullName(row)
     return ('%s %s'):format(row.firstname or '', row.lastname or '')
 end
@@ -100,10 +130,184 @@ end
 --  SESJE / UPRAWNIENIA
 -- ═════════════════════════════════════════════════════════════
 function Server.CanManage(xPlayer)
-    local job = xPlayer and xPlayer.job and xPlayer.job.name
+    local job = baseJob(xPlayer and xPlayer.job and xPlayer.job.name)
     if not job or not Config.Jobs[job] then return false end
     return xPlayer.job.grade >= data.MinGrade(job)
 end
+
+-- ═════════════════════════════════════════════════════════════
+--  BLOKADY: krzesło i panel (jedna osoba naraz)
+--
+--  Krzesło: dopóki ktoś siedzi, nikt inny nie może zająć tego samego krzesła
+--  (klient pyta serwer PRZED animacją siadania).
+--  Panel:   jedna osoba na pracę – dotyczy także otwarcia komendą /bossmenu
+--  albo exportem, więc dwóch szefów nie klika w tym samym panelu.
+--  Wszystko trzyma serwer; klient dostaje tylko odpowiedź „wolne/zajęte”.
+-- ═════════════════════════════════════════════════════════════
+local Seats  = {}      -- [punkt] = { src, name, job, since }
+local SeatBy = {}      -- [src] = punkt   (żeby zwolnić po rozłączeniu)
+local Panels = {}      -- [praca] = { src, name, since, key }
+local ANIM_RANGE = 60.0
+local lastAnim = {}
+
+local function lockEnabled()
+    return not (Config.Panel and Config.Panel.singleUser == false)
+end
+
+local function jobAllowed(loc, job)
+    if type(loc) ~= 'table' then return false end
+    if loc.jobs then return loc.jobs[job] ~= nil end
+    return loc.job == job
+end
+
+-- najbliższy punkt tej pracy (nil, gdy gracz stoi za daleko od wszystkich / jeszcze się wczytuje)
+local function pointOf(src, job)
+    local ped = GetPlayerPed(src)
+    if not ped or ped == 0 then return nil end
+
+    local pos = GetEntityCoords(ped)
+    if pos.x == 0.0 and pos.y == 0.0 and pos.z == 0.0 then return nil end
+
+    local key, loc, dist
+    for k, l in pairs(Config.Locations) do
+        if jobAllowed(l, job) then
+            local d = #(pos - vec3(l.mcoords.x, l.mcoords.y, l.mcoords.z))
+            if not dist or d < dist then key, loc, dist = k, l, d end
+        end
+    end
+    if loc and dist <= (loc.radius or loc.distance or 2.0) + 3.0 then return key, loc end
+    return nil
+end
+
+local function displayName(src)
+    local x = ESX.GetPlayerFromId(src)
+    if x then
+        local ok, name = pcall(x.getName, x)
+        if ok and type(name) == 'string' and name ~= '' then return name end
+    end
+    return ('gracz #%d'):format(src)
+end
+
+local function panelHolder(job)
+    local h = Panels[job]
+    if not h then return nil end
+    if not ESX.GetPlayerFromId(h.src) then Panels[job] = nil; return nil end
+    return h
+end
+
+-- mówi wszystkim, kto aktualnie siedzi w panelu (podpowiedź przy krześle w textUI)
+local function broadcastPanel(job)
+    local h = Panels[job]
+    TriggerClientEvent('crp_bossmenu:client:panelBusy', -1, job, h and h.name or nil)
+end
+
+local function freePanel(src, job)
+    local h = Panels[job]
+    if h and h.src == src then
+        Panels[job] = nil
+        broadcastPanel(job)
+    end
+end
+
+local function releaseLocks(src)
+    local key = SeatBy[src]
+    if key then
+        Seats[key] = nil
+        SeatBy[src] = nil
+    end
+    for job, h in pairs(Panels) do
+        if h.src == src then Panels[job] = nil; broadcastPanel(job) end
+    end
+    lastAnim[src] = nil
+end
+
+-- krzesło: klient pyta przed animacją siadania (want = true/false)
+RegisterNetEvent('crp_bossmenu:server:seat', function(key, want)
+    local src = playerSrc(source)
+    if not src then return end                     -- krzesło może zająć tylko gracz, nie inny zasób
+    local loc = type(key) == 'string' and Config.Locations[key]
+    local x = ESX.GetPlayerFromId(src)
+    local job = baseJob(x and x.job and x.job.name)
+
+    if not loc or not job or not jobAllowed(loc, job) then
+        return TriggerClientEvent('crp_bossmenu:client:seatRes', src, key, false)
+    end
+
+    if want == false then
+        if Seats[key] and Seats[key].src == src then
+            Seats[key] = nil
+            SeatBy[src] = nil
+        end
+        return TriggerClientEvent('crp_bossmenu:client:seatRes', src, key, false)
+    end
+
+    if not lockEnabled() then
+        return TriggerClientEvent('crp_bossmenu:client:seatRes', src, key, true)
+    end
+
+    if not Server.CanManage(x) then
+        TriggerClientEvent('crp_bossmenu:client:seatRes', src, key, false)
+        return TriggerClientEvent('crp_bossmenu:client:notify', src, 'Nie masz dostępu do panelu zarządzania.', 'error')
+    end
+
+    -- musi stać przy TYM krześle – danych z klienta nie bierzemy na słowo
+    if pointOf(src, job) ~= key then
+        TriggerClientEvent('crp_bossmenu:client:seatRes', src, key, false)
+        return TriggerClientEvent('crp_bossmenu:client:notify', src, 'Musisz stać przy krześle panelu.', 'error')
+    end
+
+    local seat = Seats[key]
+    if seat and seat.src ~= src then
+        TriggerClientEvent('crp_bossmenu:client:seatRes', src, key, false, seat.name)
+        TriggerClientEvent('crp_bossmenu:client:notify', src,
+            ('Panel jest teraz używany przez %s – poczekaj, aż skończy.'):format(seat.name), 'error')
+        return
+    end
+
+    Seats[key] = { src = src, name = displayName(src), job = job, since = os.time() }
+    SeatBy[src] = key
+    TriggerClientEvent('crp_bossmenu:client:seatRes', src, key, true)
+end)
+
+-- animacja krzesła u pozostałych graczy (TaskSynchronizedScene jest lokalny!)
+local ANIM_PHASES = { enter = true, base = true, computer_enter = true, computer_idle = true,
+                      computer_exit = true, exit = true, stop = true }
+
+RegisterNetEvent('crp_bossmenu:server:anim', function(key, phase)
+    local src = playerSrc(source)
+    if not src or not ANIM_PHASES[phase] or type(key) ~= 'string' then return end
+
+    local now = GetGameTimer()
+    if lastAnim[src] and now - lastAnim[src] < 100 then return end     -- prosty rate-limit
+    lastAnim[src] = now
+
+    local loc = Config.Locations[key]
+    if not loc or not loc.chaircoords then return end
+
+    local ped = GetPlayerPed(src)
+    if not ped or ped == 0 then return end
+
+    -- „stop” wysyłamy zawsze (gracz mógł już odejść od krzesła), pozostałe fazy – tylko przy krześle
+    local pos = GetEntityCoords(ped)
+    local chair = loc.chaircoords
+    if phase ~= 'stop' and (pos.x ~= 0.0 or pos.y ~= 0.0)
+        and #(pos - vec3(chair.x, chair.y, chair.z)) > (loc.radius or loc.distance or 2.0) + 3.0 then
+        return
+    end
+
+    local range = (Config.Panel and Config.Panel.animRange) or ANIM_RANGE
+    for _, id in ipairs(GetPlayers()) do
+        local tgt = tonumber(id)
+        if tgt and tgt ~= src then
+            local tped = GetPlayerPed(tgt)
+            if tped and tped ~= 0 and #(GetEntityCoords(tped) - pos) <= range then
+                TriggerClientEvent('crp_bossmenu:client:anim', tgt, src, key, phase,
+                    chair.x, chair.y, chair.z, chair.w or chair.heading or 0.0)
+            end
+        end
+    end
+end)
+
 
 -- kontekst gracza albo nil, powód
 local function context(src)
@@ -111,7 +315,7 @@ local function context(src)
     if not s then return nil, 'Panel nie jest otwarty' end
 
     local x = ESX.GetPlayerFromId(src)
-    if not x or x.job.name ~= s.job or not Server.CanManage(x) then
+    if not x or baseJob(x.job.name) ~= s.job or not Server.CanManage(x) then
         return nil, 'Straciłeś dostęp do panelu'
     end
 
@@ -123,8 +327,10 @@ local function context(src)
 end
 
 function Server.ForceClose(src)
-    if Sessions[src] then
+    local s = Sessions[src]
+    if s then
         Sessions[src] = nil
+        freePanel(src, s.job)
         TriggerClientEvent('crp_bossmenu:client:forceClose', src)
     end
 end
@@ -143,7 +349,8 @@ local function nearLocation(src, job)
     if not Config.RequireLocation then return true end
     local pos = GetEntityCoords(GetPlayerPed(src))
     for _, loc in pairs(Config.Locations) do
-        if loc.job == job and #(pos - vec3(loc.mcoords.x, loc.mcoords.y, loc.mcoords.z)) <= (loc.radius or 2.0) + 2.0 then
+        -- klient aktywuje punkt z `distance` (c_main.lua), `radius` (jeśli ustawiony) zawęża tylko serwer
+        if loc.job == job and #(pos - vec3(loc.mcoords.x, loc.mcoords.y, loc.mcoords.z)) <= (loc.radius or loc.distance or 2.0) + 2.0 then
             return true
         end
     end
@@ -156,26 +363,46 @@ function Server.Open(src)
     lastOpen[src] = now
 
     local x = ESX.GetPlayerFromId(src)
-    if not x or not Server.CanManage(x) then
+    local job = baseJob(x and x.job and x.job.name)
+    if not x or not job or not Config.Jobs[job] or not Server.CanManage(x) then
         TriggerClientEvent('crp_bossmenu:client:forceClose', src)
         return TriggerClientEvent('crp_bossmenu:client:notify', src, 'Nie masz dostępu do panelu zarządzania.', 'error')
     end
-    if not nearLocation(src, x.job.name) then
+    if not nearLocation(src, job) then
         TriggerClientEvent('crp_bossmenu:client:forceClose', src)
         return TriggerClientEvent('crp_bossmenu:client:notify', src, 'Musisz być przy panelu zarządzania.', 'error')
     end
 
     local me = data.FindByIdentifier(x.identifier)
-    if not me then return end
+    if not me then
+        -- wcześniej cichy `return` – gracz czekał 3 s na „brak odpowiedzi serwera”
+        TriggerClientEvent('crp_bossmenu:client:forceClose', src)
+        return TriggerClientEvent('crp_bossmenu:client:notify', src,
+            'Nie znaleziono Twojej postaci w bazie (sprawdź Config.Db: identifier/kolumny w tabeli graczy).', 'error')
+    end
+
+    -- jedna osoba na panel: sprawdzamy i zajmujemy blokadę PRZED wczytaniem danych
+    if lockEnabled() then
+        local holder = panelHolder(job)
+        if holder and holder.src ~= src then
+            TriggerClientEvent('crp_bossmenu:client:forceClose', src)
+            return TriggerClientEvent('crp_bossmenu:client:notify', src,
+                ('Panel jest teraz używany przez %s – poczekaj, aż skończy.'):format(holder.name), 'error')
+        end
+        local full = ('%s %s'):format(me.firstname or '', me.lastname or ''):gsub('^%s+', ''):gsub('%s+$', '')
+        Panels[job] = { src = src, name = (full ~= '' and full or displayName(src)), since = os.time(), key = pointOf(src, job) }
+        broadcastPanel(job)
+    end
 
     Sessions[src] = {
-        job = x.job.name, identifier = x.identifier,
+        job = job, identifier = x.identifier,
         ssn = me.ssn or x.identifier, firstname = me.firstname or '', lastname = me.lastname or '', grade = x.job.grade
     }
 
     local ok, payload = pcall(data.Build, Sessions[src])
     if not ok then
         Sessions[src] = nil
+        freePanel(src, job)                     -- nie zostawiamy po sobie blokady panelu
         print('^1[crp_bossmenu] Build:^7', payload)
         return TriggerClientEvent('crp_bossmenu:client:notify', src, 'Błąd wczytywania danych panelu.', 'error')
     end
@@ -283,7 +510,9 @@ end
 
 local function summary(items)
     local parts = {}
-    for i, it in ipairs(items) do parts[i] = ('%s ×%d'):format(it.name or it.model, it.qty or 1) end
+    for i, it in ipairs(items) do
+        parts[i] = ('%s ×%d%s'):format(it.name or it.model, it.qty or 1, it.express and ' ⚡' or '')
+    end
     return table.concat(parts, ', ')
 end
 
@@ -549,7 +778,7 @@ H.deposit = function(c, d)
     end
 
     data.Tx(c.job, 'in', amount, c.name, 'Wpłata')
-    return { ok = true }
+    return { ok = true, funds = data.Funds(c.job) }
 end
 
 H.withdraw = function(c, d)
@@ -559,7 +788,7 @@ H.withdraw = function(c, d)
 
     c.xPlayer.addAccountMoney(Config.PlayerAccount, amount)
     data.Tx(c.job, 'out', amount, c.name, 'Wypłata', reason)
-    return { ok = true }
+    return { ok = true, funds = data.Funds(c.job) }
 end
 
 -- ── garaż ──
@@ -668,6 +897,8 @@ H.cancelOrder = function(c, d)
         return err('Zamówienie nie może już zostać anulowane')
     end
 
+    Server.CancelDelivery(id, order, 'cancelled')
+
     data.AddFunds(c.job, order.total)
     local items = json.decode(order.items) or {}
     local names = {}
@@ -698,6 +929,13 @@ H.supplierOrder = function(c, d)
     local order = data.GetOrder(id, kind, 'supplier_job', c.job)
     if not order then return err('Nie znaleziono zamówienia') end
 
+    -- fizyczna dostawa: nie da się „dostarczyć” aut z panelu, zanim laweta ich nie odda
+    if action == 'deliver' and kind == 'vehicles' and order.delivery == 'physical'
+        and Server.DeliveryEnabled() and not (Config.VehicleShop.delivery or {}).manualOverride then
+        return err('Pojazdy są w drodze lawetą – oddanie potwierdza firma dostawcy na miejscu odbioru')
+    end
+    if action == 'deliver' and kind == 'vehicles' then Server.CancelDelivery(id, order, 'manual') end
+
     local from = action == 'deliver' and 'accepted' or 'pending'
     local to   = ({ accept = 'accepted', reject = 'rejected', deliver = 'delivered' })[action]
     if not data.SetOrderStatus(id, 'supplier_job', c.job, from, to, reason, order.buyer_job, c.job) then
@@ -711,12 +949,17 @@ H.supplierOrder = function(c, d)
     local orderNo = (kind == 'vehicles' and 'ord-' or 'zam-') .. id
 
     if action == 'reject' then
+        if kind == 'vehicles' then Server.CancelDelivery(id, order, 'rejected') end
         data.AddFunds(order.buyer_job, order.total)
         data.Tx(order.buyer_job, 'in', order.total, 'System', 'Zwrot za zamówienie', ('%s (odrzucone): %s'):format(orderNo, table.concat(names, ', ')))
         Server.NotifyJob(order.buyer_job, ('Zamówienie %s zostało odrzucone – środki wróciły na konto firmy'):format(orderNo), 'warn')
 
     elseif action == 'accept' then
-        Server.NotifyJob(order.buyer_job, ('Zamówienie %s zostało przyjęte do realizacji'):format(orderNo), 'success')
+        -- pojazdy bez szybkiego transportu: nie wpisujemy ich od razu do garażu,
+        -- tylko wysyłamy zadanie do zasobu CD (auta jadą na lawecie `tr2`)
+        if kind ~= 'vehicles' or not Server.StartDelivery(order, items, c.name) then
+            Server.NotifyJob(order.buyer_job, ('Zamówienie %s zostało przyjęte do realizacji'):format(orderNo), 'success')
+        end
 
     else
         data.AddFunds(c.job, order.total)
@@ -756,16 +999,26 @@ H.orderGoods = function(c, d)
     local catalog = {}
     for _, p in ipairs(data.Products(supplierJob)) do catalog[p.id] = p end
 
-    local items, total = {}, 0
+    local items, total, express = {}, 0, 0
     for _, picked in ipairs(d.items) do
         local product = type(picked) == 'table' and catalog[tonumber(picked.id)]
         local qty = type(picked) == 'table' and int(picked.qty, 1, vs.maxQty)
         if not product or not product.active or not data.HasAccess(product, c.job) or not qty then
             return err('Nieprawidłowa pozycja zamówienia')
         end
+        -- pojazdy zamawia się w Garażu (katalog), nie w zamówieniach towarowych
+        if product.model and product.model ~= '' then
+            return err('Ten produkt to pojazd – zamów go w Garażu (zakładka Katalog)')
+        end
 
-        items[#items + 1] = { id = product.id, name = product.name, price = product.price, qty = qty }
-        total = total + product.price * qty
+        -- szybki transport: dopłatę (za sztukę) ustawia dostawca na produkcie, ewentualnie domyślna z Config.Goods;
+        -- kupujący tylko zaznacza „zwykły / szybki”
+        local fee = tonumber(product.expressFee) or tonumber(vs.expressFee) or 0
+        local fast = picked.express == true and fee > 0
+        items[#items + 1] = { id = product.id, name = product.name, price = product.price, qty = qty,
+                              express = fast, fee = fast and fee or 0 }
+        total = total + product.price * qty + (fast and fee * qty or 0)
+        if fast then express = express + 1 end
     end
 
     local note = str(d.note or '', 300) or ''
@@ -779,9 +1032,11 @@ H.orderGoods = function(c, d)
 
     data.Tx(c.job, 'out', total, c.name, 'Zamówienie towarów', ('%s: %s'):format(data.JobLabel(supplierJob), summary(items)))
     data.Hist(c.job, c.name, { type = 'goodsOrder', orderId = 'zam-' .. id, supplier = data.JobLabel(supplierJob), lines = #items,
-        units = (function() local n = 0 for _, it in ipairs(items) do n = n + it.qty end return n end)(), total = total, items = items })
+        units = (function() local n = 0 for _, it in ipairs(items) do n = n + it.qty end return n end)(),
+        express = express, total = total, items = items })
 
-    Server.NotifyJob(supplierJob, ('Nowe zamówienie towarów od %s (zam-%d)'):format(data.JobLabel(c.job), id), 'info')
+    Server.NotifyJob(supplierJob, ('Nowe zamówienie towarów od %s (zam-%d)%s'):format(data.JobLabel(c.job), id,
+        express > 0 and (' – szybki transport: %d %s'):format(express, plural(express, 'pozycja', 'pozycje', 'pozycji')) or ''), 'info')
     Server.Refresh(supplierJob, c.job)
 
     return { ok = true, funds = data.Funds(c.job), order = {
@@ -807,6 +1062,12 @@ H.saveProduct = function(c, d)
     if not model then return err('Model pojazdu jest za długi (max 50 znaków)') end
     if model ~= '' and not model:match('^[%w_%-]+$') then return err('Model pojazdu: tylko litery, cyfry, - i _') end
     model = model ~= '' and model or nil
+
+    -- modelem steruje wyłącznie firma-dostawca pojazdów (Config.VehicleShop.supplierJob) – tylko takie
+    -- pozycje trafiają do katalogu w Garażu i tylko one znikają z zamówień towarowych
+    if model and c.job ~= (Config.VehicleShop and Config.VehicleShop.supplierJob) then
+        return err('Model pojazdu może ustawić tylko firma-dostawca pojazdów')
+    end
 
     local expressFee
     if d.expressFee ~= nil and d.expressFee ~= '' and d.expressFee ~= json.null then
@@ -842,7 +1103,7 @@ H.saveProduct = function(c, d)
     else
         local entry
         if previous.price ~= price then entry = { action = 'price', from = previous.price, to = price }
-        elseif (previous.active == 1) ~= product.active then entry = { action = product.active and 'show' or 'hide' }
+        elseif flag(previous.active) ~= product.active then entry = { action = product.active and 'show' or 'hide' }
         elseif (previous.access or '') ~= (access and json.encode(access) or '') then entry = { action = 'access' }
         else entry = { action = 'edit' } end
         entry.type, entry.name = 'offerChange', name
@@ -869,12 +1130,321 @@ end
 
 
 -- ═════════════════════════════════════════════════════════════
+--  FIZYCZNA DOSTAWA POJAZDÓW (gdy kupujący NIE wybrał szybkiego transportu)
+--
+--  Zamówienie pojazdów bez ⚡ nie kończy się „magicznym” wpisem do garażu:
+--  firma-dostawca (CD) musi załadować auta na lawetę i odwieźć je na miejsce.
+--  Panel tylko:
+--    • przy przyjęciu zamówienia generuje tablice i wysyła zadanie do zasobu dostawy,
+--    • przy potwierdzeniu oddania aut (z zasobu dostawy) płaci i wpisuje pojazdy do garażu.
+--  Gdy zasób dostawy nie jest uruchomiony, wszystko działa po staremu (auta od razu w garażu).
+-- ═════════════════════════════════════════════════════════════
+local Physical = {}      -- [id zamówienia] = { items = {...}, plates = { [1] = 'ABC 123' }, handed = {...}, at, by }
+
+-- ── NIGDY nie porównujemy surowego `source` ──────────────────────────────────
+--  Gdy event wywołuje INNY zasób (a nie gracz), do handlera potrafi trafić cokolwiek:
+--  liczba, tekst, `nil`, a nawet funkcja-callback. Wcześniej `src > 0` wywalało wtedy
+--  „attempt to compare number with string” i przewracało całą akcję (np. przyjęcie zamówienia).
+
+local function deliveryCfg() return (Config.VehicleShop and Config.VehicleShop.delivery) or {} end
+
+function Server.DeliveryEnabled()
+    local res = deliveryCfg().resource
+    return type(res) == 'string' and res ~= '' and GetResourceState(res) == 'started'
+end
+
+-- czy w zamówieniu jest choć jeden pojazd bez szybkiego transportu
+local function hasPhysicalItems(items)
+    for _, it in ipairs(items or {}) do if not it.express then return true end end
+    return false
+end
+
+-- adres dostawy: punkt bossmenu pracy zamawiającej (np. policja → komenda); nil = adres z configu nano
+local function deliveryDestination(buyerJob)
+    for _, loc in pairs(Config.Locations) do
+        if loc.job == buyerJob and loc.mcoords then
+            local chair = loc.chaircoords
+            return { x = loc.mcoords.x, y = loc.mcoords.y, z = loc.mcoords.z,
+                     heading = (chair and (chair.w or chair.heading)) or 0.0, label = data.JobLabel(buyerJob) }
+        end
+    end
+    return nil
+end
+
+local function pendingRow(id)
+    for _, r in ipairs(data.Orders(Config.VehicleShop.supplierJob).supplier) do
+        if r.id == id then return r end
+    end
+end
+
+-- buduje i wysyła zadanie dostawy do zasobu CD (używa tego też ResendDeliveries)
+local function dispatchDelivery(order, items)
+    local cfg = deliveryCfg()
+    local id = order.id
+
+    local task, resend = Physical[id], Physical[id] ~= nil
+    if not task then
+        task = { plates = {}, by = order.by_name, at = os.time() }
+        Physical[id] = task
+    end
+
+    local payload = {
+        orderId    = 'ord-' .. id,
+        id         = id,
+        buyerJob   = order.buyer_job,
+        buyerLabel = data.JobLabel(order.buyer_job),
+        supplierJob = order.supplier_job,
+        total      = order.total,
+        destination = deliveryDestination(order.buyer_job),
+        items      = {}
+    }
+
+    for i, it in ipairs(items) do
+        -- tablice generujemy raz – auto dostanie je już na placu, a my zapiszemy je w garażu
+        if not it.express and not task.plates[i] then task.plates[i] = data.NewPlate() end
+        payload.items[#payload.items + 1] = {
+            index = i, model = it.model, name = it.name, category = it.category or '',
+            express = it.express and true or false, plate = task.plates[i]
+        }
+    end
+
+    -- kolejność: najpierw wpisy w tasku, potem event (zasób CD czyta od razu)
+    TriggerEvent(cfg.event or 'crp_cd:server:start', payload)
+    if resend and cfg.resendEvent then TriggerEvent(cfg.resendEvent, payload) end
+    return payload
+end
+
+function Server.StartDelivery(order, items, who)
+    if not Server.DeliveryEnabled() then return false end
+    if not hasPhysicalItems(items) then return false end
+
+    data.SetOrderDelivery(order.id, 'physical', order.buyer_job, order.supplier_job)
+    local payload = dispatchDelivery(order, items)
+    Physical[order.id].by = who or order.by_name
+
+    -- pozycje z szybkim transportem w tym samym zamówieniu nie jadą lawetą –
+    -- wpisujemy je do garażu od razu (za nie właśnie dopłacono)
+    local fast = {}
+    for _, it in ipairs(items) do
+        if it.express then
+            local plate = data.NewPlate()
+            if plate then
+                data.AddVehicle(order.buyer_job, plate, it.model, it.name, it.category)
+                data.GrantVehicle(order.buyer_job, plate, it.model)
+                fast[#fast + 1] = ('%s (%s)'):format(it.name or it.model, plate)
+            end
+        end
+    end
+    if #fast > 0 then
+        Server.NotifyJob(order.buyer_job, ('Szybki transport – już w garażu: %s'):format(table.concat(fast, ', ')), 'success')
+        Physical[order.id].fast = fast
+    end
+
+    Server.NotifyJob(order.supplier_job, ('Zamówienie %s: %d %s do odwiezienia do %s – załaduj auta na lawetę (tr2).'):format(
+        payload.orderId, #payload.items, plural(#payload.items, 'pojazd', 'pojazdy', 'pojazdów'), payload.buyerLabel), 'info')
+    Server.NotifyJob(order.buyer_job, ('Zamówienie %s przyjęte – pojazdy zostaną dostarczone lawetą.'):format(payload.orderId), 'info')
+    return true
+end
+
+-- anulowanie zadania (odrzucenie zamówienia, ręczna dostawa z panelu, rozłączenie itd.)
+function Server.CancelDelivery(id, order, why)
+    local cfg = deliveryCfg()
+    Physical[id] = nil
+    if order then data.SetOrderDelivery(id, nil, order.buyer_job, order.supplier_job) end
+    if cfg.cancelEvent then TriggerEvent(cfg.cancelEvent, 'ord-' .. id, why or '') end
+end
+
+-- ponowne wysłanie zadań dla zamówień, które czekają na dostawę (po restarcie zasobu CD)
+function Server.ResendDeliveries(supplierJob, to)
+    if not Server.DeliveryEnabled() then return 0 end
+    if supplierJob ~= Config.VehicleShop.supplierJob then return 0 end
+
+    local count = 0
+    for _, r in ipairs(data.Orders(supplierJob).supplier) do
+        if r.status == 'accepted' and r.delivery == 'physical' then
+            local payload = dispatchDelivery(r, r.items or {})
+            count = count + 1
+            if to then TriggerClientEvent('crp_bossmenu:client:notify', to, ('Zadanie %s wznowione – %d %s do odwiezienia'):format(
+                payload.orderId, #payload.items, plural(#payload.items, 'pojazd', 'pojazdy', 'pojazdów')), 'info') end
+        end
+    end
+    return count
+end
+
+-- ── zgłoszenie oddania pojazdów (z zasobu dostawy) ──
+--  plates = { { index = 1, plate = 'ABC 123' }, ... } – auta oddane w tym kursie
+--  final  = true, gdy to była ostatnia partia zamówienia (wtedy płacimy i zamykamy zamówienie)
+RegisterNetEvent('crp_bossmenu:server:deliveryDone', function(orderId, plates, final, byName)
+    local src = playerSrc(source)
+    local id = tonumber(tostring(orderId or ''):match('(%d+)$') or '')
+    if not id then return end
+
+    local order = data.GetOrderRaw(id, 'vehicles')
+    if not order then return end
+    if order.delivery ~= 'physical' then return end
+
+    -- kto zgłasza? gracz-lider firmy dostawcy (albo zgłoszenie z innego zasobu – wtedy `source` nie jest graczem)
+    local by = whoName(byName, 'System')
+    if src then
+        local x = ESX.GetPlayerFromId(src)
+        if not x or baseJob(x.job and x.job.name) ~= order.supplier_job or not Server.CanManage(x) then
+            return print(('^1[crp_bossmenu] dostawa %d: zgłoszenie od gracza bez uprawnień (src %s)^7'):format(id, src))
+        end
+        by = x.name or ('gracz #%d'):format(src)
+    end
+
+    local items = type(order.items) == 'string' and (json.decode(order.items) or {}) or (order.items or {})
+    local task  = Physical[id]
+    if task then task.handed = task.handed or {} end
+    local handed = (task and task.handed) or {}
+
+    -- ── co przyszło w `plates`? Obsługujemy każdą rozsądną postać, bo wołają nas różne zasoby:
+    --    { { index = 1, plate = 'ABC 123' }, ... }   (nasz nano_cd)
+    --    { 'ABC 123', 'DEF 456' }                    (lista tablic – kolejność = kolejność aut)
+    --    '["ABC 123"]' / '{"1":"ABC 123"}' / 'ABC 123' (tekst, także JSON)
+    --    nil                                         („oddane” – użyj tablic wygenerowanych przy zadaniu)
+    local provided = plates
+    if type(provided) == 'string' then
+        local txt = provided:gsub('^%s+', ''):gsub('%s+$', '')
+        local decoded
+        if txt:sub(1, 1) == '[' or txt:sub(1, 1) == '{' then
+            local ok, d = pcall(json.decode, txt)
+            if ok and type(d) == 'table' then decoded = d end
+        end
+        if decoded then provided = decoded
+        elseif txt ~= '' then provided = { txt } end
+    end
+
+    -- pozycje, które jeszcze nie zostały oddane (szybki transport pomijamy – te auta są już w garażu)
+    local queue = {}
+    for i, it in ipairs(items) do
+        if not it.express and not handed[i] then queue[#queue + 1] = i end
+    end
+
+    -- brak tablic w zgłoszeniu → bierzemy te, które wygenerowaliśmy przy wysyłaniu zadania
+    if type(provided) ~= 'table' or #provided == 0 then
+        provided = {}
+        for k, i in ipairs(queue) do provided[k] = { index = i, plate = task and task.plates and task.plates[i] or nil } end
+    end
+
+    local names, granted = {}, 0
+    local pos = 0
+    for _, entry in ipairs(provided) do
+        local i, plate
+        if type(entry) == 'table' then
+            i = tonumber(entry.index or entry[1])
+            plate = tostring(entry.plate or entry[2] or '')
+        else
+            pos = pos + 1
+            i = queue[pos] or queue[1]
+            plate = tostring(entry or '')
+        end
+
+        local it = i and items[i]
+        if it and not it.express and not handed[i] then
+            if plate == '' or not plate:match('^[%w ]+$') or #plate > 12 then
+                plate = (task and task.plates and task.plates[i]) or data.NewPlate()
+            end
+
+            if plate then
+                handed[i] = plate
+                data.AddVehicle(order.buyer_job, plate, it.model, it.name, it.category)
+                data.GrantVehicle(order.buyer_job, plate, it.model)
+                granted = granted + 1
+                names[#names + 1] = ('%s (%s)'):format(it.name or it.model, plate)
+            end
+        end
+    end
+
+    if granted == 0 then
+        return print(('^3[crp_bossmenu]^7 dostawa %d: nie rozpoznano żadnej tablicy – nic nie zapisano'):format(id))
+    end
+
+    -- ile aut z tego zamówienia jeszcze zostało na lawecie? (decyduje, czy zamykamy zamówienie)
+    local left = 0
+    for i, it in ipairs(items) do
+        if not it.express and not handed[i] then left = left + 1 end
+    end
+
+    -- `final` może przyjść jako true/1/'true', a gdy go nie ma – domykamy, jeśli wszystko już oddane
+    if final == nil then final = (left == 0) else final = (final == true or final == 1 or final == 'true' or final == '1') end
+
+    local orderNo, buyerLabel = 'ord-' .. id, data.JobLabel(order.buyer_job)
+    data.Hist(order.supplier_job, by, { type = 'delivery', orderId = orderNo, buyer = buyerLabel,
+        count = granted, items = names, final = final and true or false })
+
+    Server.NotifyJob(order.buyer_job, ('Dostawa %s: odebrano %d %s (%s)'):format(orderNo, granted,
+        plural(granted, 'pojazd', 'pojazdy', 'pojazdów'), table.concat(names, ', ')), 'success')
+    Server.Refresh(order.buyer_job, order.supplier_job)
+
+    if not final then return end
+
+    -- ostatnia partia: płacimy firmie dostawcy i zamykamy zamówienie
+    if not data.SetOrderStatus(id, 'supplier_job', order.supplier_job, 'accepted', 'delivered', nil, order.buyer_job, order.supplier_job) then
+        print(('^3[crp_bossmenu]^7 dostawa %d: nie udało się zamknąć zamówienia (status się zmienił?)^7'):format(id))
+    end
+
+    data.AddFunds(order.supplier_job, order.total)
+    data.Tx(order.supplier_job, 'in', order.total, by, 'Dostawa zamówienia',
+        ('%s · %s (dostawa lawetą)'):format(orderNo, buyerLabel))
+    Server.NotifyJob(order.supplier_job, ('Zamówienie %s dostarczone – środki trafiły na konto firmy.'):format(orderNo), 'success')
+
+    Physical[id] = nil
+    data.SetOrderDelivery(id, nil, order.buyer_job, order.supplier_job)
+    Server.Refresh(order.buyer_job, order.supplier_job)
+end)
+
+-- zasób dostawy pyta o zadania (np. po swoim restarcie albo komendą „weź zadanie”)
+RegisterNetEvent('crp_bossmenu:server:deliveryResend', function(supplierJob, cb)
+    local src = playerSrc(source)
+
+    -- obsługa różnych sposobów wołania (inne zasoby wołają nas jak chcą):
+    --   ('centra_autos')            → konkretna firma dostawcy
+    --   (callback)                  → odpowiedź liczbą wznowionych zadań
+    --   ('centra_autos', callback)  → i jedno, i drugie
+    --   ({ supplierJob = '...' })   → nazwa pracy w tabeli
+    if type(supplierJob) == 'function' then cb, supplierJob = supplierJob, nil end
+    if type(supplierJob) == 'table' then supplierJob = supplierJob.supplierJob or supplierJob.job end
+    if type(supplierJob) ~= 'string' or supplierJob == '' then supplierJob = nil end
+    if type(cb) ~= 'function' then cb = nil end
+
+    if src then
+        local x = ESX.GetPlayerFromId(src)
+        if not x or baseJob(x.job and x.job.name) ~= Config.VehicleShop.supplierJob then
+            if cb then cb(0) end
+            return
+        end
+    elseif Config.Debug then
+        -- nie jest to gracz (np. inny zasób) – tylko log, bez blokowania
+        print(('[crp_bossmenu] deliveryResend z zewnątrz: source=%s (%s), job=%s'):format(
+            tostring(source), type(source), tostring(supplierJob)))
+    end
+
+    local n = Server.ResendDeliveries(supplierJob or Config.VehicleShop.supplierJob, src)
+    if cb then cb(n) end
+    if src and n == 0 then
+        TriggerClientEvent('crp_bossmenu:client:notify', src, 'Brak zamówień czekających na dostawę.', 'info')
+    end
+end)
+
+-- zwolnienie miejsca w pamięci po restarcie zasobu: zadania odbudują się na żądanie (ResendDeliveries)
+AddEventHandler('onResourceStart', function(resource)
+    if resource ~= GetCurrentResourceName() then return end
+    Physical = {}
+    if Server.DeliveryEnabled() then
+        print(('^2[crp_bossmenu]^7 dostawa pojazdów: obsługuje ją zasób `%s` (zamówienia bez szybkiego transportu jadą lawetą)'):format(deliveryCfg().resource))
+    end
+end)
+
+
+-- ═════════════════════════════════════════════════════════════
 --  DYSPOZYTOR AKCJI
 -- ═════════════════════════════════════════════════════════════
 local NO_REFRESH = { testWebhook = true }
 
 RegisterNetEvent('crp_bossmenu:server:req', function(reqId, action, d)
-    local src = source
+    local src = playerSrc(source)
+    if not src then return end                     -- akcje panelu wykonuje gracz
     local function reply(result) TriggerClientEvent('crp_bossmenu:client:res', src, reqId, result) end
 
     local handler = type(action) == 'string' and Actions[action]
@@ -901,10 +1471,22 @@ RegisterNetEvent('crp_bossmenu:server:req', function(reqId, action, d)
     if not NO_REFRESH[action] then Server.Refresh(c.job) end
 end)
 
-RegisterNetEvent('crp_bossmenu:server:open', function() Server.Open(source) end)
-RegisterNetEvent('crp_bossmenu:server:close', function() Sessions[source] = nil end)
+-- zamknięcie panelu: sesja + blokada panelu (krzesło zwalnia dopiero wstanie z niego)
+function Server.Close(src)
+    local s = Sessions[src]
+    Sessions[src] = nil
+    if s then freePanel(src, s.job) end
+end
+
+RegisterNetEvent('crp_bossmenu:server:open', function()
+    local src = playerSrc(source); if src then Server.Open(src) end
+end)
+RegisterNetEvent('crp_bossmenu:server:close', function()
+    local src = playerSrc(source); if src then Server.Close(src) end
+end)
 
 AddEventHandler('playerDropped', function()
+    releaseLocks(source)
     Sessions[source] = nil
     lastOpen[source] = nil
 end)
@@ -940,6 +1522,49 @@ CreateThread(function()
     end
 end)
 
+-- Sprzątanie blokad: rozłączenia, wyjście z krzesła „po cichu” (crash klienta/teleport), zawieszone sesje.
+-- Bez tego po crashu gracza krzesło zostałoby zajęte na zawsze.
+if lockEnabled() then
+    CreateThread(function()
+        while true do
+            Wait(15000)
+
+            local now = os.time()
+            local maxSeat = (Config.Panel and Config.Panel.seatTimeout) or 0
+            local maxDist = (Config.Panel and Config.Panel.releaseDistance) or 10.0
+
+            for key, seat in pairs(Seats) do
+                local drop = not ESX.GetPlayerFromId(seat.src)
+                if not drop and maxSeat and maxSeat > 0 and (now - seat.since) > maxSeat then drop = true end
+
+                if not drop then
+                    local loc = Config.Locations[key]
+                    local ok, pos = pcall(function() return GetEntityCoords(GetPlayerPed(seat.src)) end)
+                    if ok and loc and loc.chaircoords and type(pos) == 'table' then
+                        -- (0,0,0) = gracz jeszcze się wczytuje – wtedy blokady nie ruszamy
+                        if (pos.x ~= 0.0 or pos.y ~= 0.0)
+                            and #(pos - vec3(loc.chaircoords.x, loc.chaircoords.y, loc.chaircoords.z)) > maxDist then
+                            drop = true
+                        end
+                    end
+                end
+
+                if drop then
+                    Seats[key] = nil
+                    if SeatBy[seat.src] == key then SeatBy[seat.src] = nil end
+                end
+            end
+
+            for job, h in pairs(Panels) do
+                if not ESX.GetPlayerFromId(h.src) or not Sessions[h.src] then
+                    Panels[job] = nil
+                    broadcastPanel(job)
+                end
+            end
+        end
+    end)
+end
+
 -- Odświeżanie otwartych paneli (dane z pamięci, bez zapytań do bazy)
 if Config.Cache.refreshSeconds > 0 then
     CreateThread(function()
@@ -955,15 +1580,25 @@ if Config.Cache.rosterSeconds > 0 then
     CreateThread(function()
         while true do
             Wait(Config.Cache.rosterSeconds * 1000)
-            for _, s in pairs(Sessions) do data.RefreshRoster(s.job) end
+            for _, s in pairs(Sessions) do
+                data.RefreshRoster(s.job)
+                -- listy innych prac (Config.ViewJobs) też muszą się odświeżać
+                for _, def in ipairs(data.ViewJobList(s.job)) do data.RefreshRoster(def.job) end
+            end
         end
     end)
 end
 
 -- Ktoś zmienił pracę: lista pracowników do odświeżenia, panel zamknięty gdy stracił dostęp
 AddEventHandler('esx:setJob', function(src, job, lastJob)
-    if job and Config.Jobs[job] then data.RefreshRoster(job) end
-    if lastJob and Config.Jobs[lastJob] then data.RefreshRoster(lastJob) end
+    job, lastJob = baseJob(job), baseJob(lastJob)
+    -- zmiana pracy wpływa też na listy, które podglądają inne prace (Config.ViewJobs)
+    for _, name in ipairs({ job, lastJob }) do
+        if name and Config.Jobs[name] then
+            data.RefreshRoster(name)
+            for _, def in ipairs(data.ViewJobList(name)) do data.RefreshRoster(def.job) end
+        end
+    end
 
     if Sessions[src] and not context(src) then Server.ForceClose(src) end
 end)
@@ -988,7 +1623,7 @@ lib.callback.register('crp_jobcore:bossmenu:server:getBossmenuData', function(sr
     if not me then return {} end
 
     local ok, payload = pcall(data.Build, {
-        job = x.job.name, identifier = x.identifier, grade = x.job.grade,
+        job = baseJob(x.job.name) or x.job.name, identifier = x.identifier, grade = x.job.grade,
         ssn = me.ssn or x.identifier, firstname = me.firstname or '', lastname = me.lastname or ''
     })
     return ok and payload or {}
