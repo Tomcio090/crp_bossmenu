@@ -1,31 +1,3 @@
--- ██████████████████████████████████████████████████████████████████████████████
---  nano_cd / client.lua — wozi auta lawetą `tr2` (start skryptu CD/POD)
---
---  Co robi klient:
---   · stawia PEDZIWO na dokach i przypina do niego target (ox_target),
---   · z targetu otwiera listę aut z zamówienia (ox_lib) – wybrane auto pojawia się
---     na jednym z punktów na dokach,
---   · stawia zestaw (przyczepa `tr2` + auto do ciągnięcia) w bazie pod car dealerem,
---     ale TYLKO wtedy, gdy wiezie jakieś zadanie; sprząta, gdy zadań już nie ma,
---   · przypina auto do gniazda lawety, gdy wjedziesz nim na przyczepę,
---   · pilnuje, żeby auta oddać wyłącznie w miejscu odbioru.
---
---  Komendy w grze (/pod help):
---   /pod                 – stan zadań, zestawu i gniazd
---   /pod wez [id]        – weź zadanie (bez id: pierwsze wolne)
---   /pod menu            – lista aut do pobrania na dokach (ta sama co z targetu)
---   /pod pobierz [nr]    – pobierz auto nr z listy (bez ox_lib / bez targetu)
---   /pod attach [n]      – przypnij auto, którym jedziesz, do gniazda n (albo pierwszego wolnego)
---   /pod oddaj           – oddaj auta (tylko w miejscu odbioru)
---   /pod przyczepa       – postaw/znajdź zestaw (przyczepa + ciężarówka)
---   /pod truck           – postaw samo auto do ciągnięcia
---   /pod sprzataj        – usuń zestaw i auta pobrane na dokach
---   /pod slot [n]        – wypisz offset/rot auta względem przyczepy (kalibracja gniazd)
---   /pod zapisz <co>     – wypisz gotową linijkę do configu: base | przyczepa | truck |
---                          doki | ped | punkt | oddanie
---   /pod test            – szybki test: zestaw + wzięcie zadania + auta na dokach
--- ██████████████████████████████████████████████████████████████████████████████
-
 local Jobs = {}                -- [id] = zadanie (to, co przysłał serwer)
 local Trailer = nil            -- uchwyt przyczepy `tr2`
 local Truck = nil              -- uchwyt auta do ciągnięcia

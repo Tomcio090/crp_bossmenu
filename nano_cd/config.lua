@@ -1,26 +1,3 @@
--- ██████████████████████████████████████████████████████████████████████████████
---  nano_cd / config.lua — CAŁA konfiguracja dostawy lawetą
---
---  Zasada: każdy opis stoi NAD kluczem, w linii klucza nie ma żadnych komentarzy.
---  Wszystkie współrzędne z „PODMIEŃ” to wartości startowe – poustawiaj je w grze
---  komendami:  /pod base  (baza pod car dealerem)  /pod doki  (doki)  /pod slot N
---
---  JAK TO DZIAŁA (skrót):
---   1. Boss menu (crp_jobcore) przyjmuje zamówienie pojazdów bez szybkiego transportu
---      i wysyła nam zadanie (`crp_cd:server:start`). Dopiero TERAZ — przy przyjęciu
---      zamówienia — pojawia się laweta z ciężarówką w bazie pod car dealerem.
---   2. Pracownik CD jedzie lawetą do DOKÓW. Przy pedzie na dokach jest target
---      (ox_target), a z niego lista aut z zamówienia (ox_lib) — wybierasz auto,
---      ono pojawia się na dokach, a Ty wjeżdżasz nim na lawetę (auto samo się przypina).
---   3. Gdy wszystkie auta (bez szybkiego transportu) są na lawecie, wieziesz je do
---      miejsca odbioru — dla zamówień policji to komenda; adres przysyła boss menu.
---   4. Oddanie działa TYLKO w promieniu Config.Handover.radius od tego miejsca.
---      Wtedy zgłaszamy do boss menu „oddane” → auta do garażu kupującego, kasa
---      dla firmy dostawcy, zamówienie na „Dostarczone”.
---   5. Gdy nie ma już żadnego zadania, a laweta jest pusta, zestaw znika (Config.Base,
---      `removeWhenIdle`) — świat zostaje czysty.
--- ██████████████████████████████████████████████████████████████████████████████
-
 Config = {}
 
 -- ── DIAGNOSTYKA ───────────────────────────────────────────────────────────────
@@ -232,7 +209,6 @@ Config.Handover = {
     -- Z jakiej odległości od miejsca odbioru wolno oddać auta (klient – podpowiedź i [E]).
     radius = 25.0,
 
-    -- Używany TYLKO wtedy, gdy zamówienie nie ma adresu (praca bez punktu w boss menu).
     fallback = {
         x = 441.5,
         y = -982.5,

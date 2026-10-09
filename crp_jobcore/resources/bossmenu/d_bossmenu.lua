@@ -177,11 +177,18 @@ Config.ViewJobs = {
 
 Config.Locations = {
     ['mrpd'] = {
-        job            = 'centra_autos',
+        job            = 'police',
         mcoords        = vec4(461.4712, -987.8772, 31.2, 0.4353),      -- środek punktu
         distance       = 20.0,                                         -- z jakiej odległości punkt się aktywuje
         bossmenucoords = vec4(461.5347, -986.2550, 30.6604, 180.0223), -- strefa ox_target „Otwórz Boss Menu”
         chaircoords    = vec4(461.7296, -985.3137, 30.4, 305.0)        -- gdzie spawnuje się krzesło
+    },
+    ['centra_autos'] = {
+        job            = 'centra_autos',
+        mcoords        = vec4(-924.9637, -1169.8820, 4.9501, 138.3062),      -- środek punktu
+        distance       = 20.0,                                         -- z jakiej odległości punkt się aktywuje
+        bossmenucoords = vec4(-924.3383, -1167.5292, 4.7838, 196.5054), -- strefa ox_target „Otwórz Boss Menu”
+        chaircoords    = vec4(-924.7601, -1166.9054, 4.6, 2.7027)        -- gdzie spawnuje się krzesło
     },
 
     -- UWAGA: wpis 'mrpd1' (policja) miał IDENTYCZNE współrzędne co 'mrpd' (centra_autos), przez co
