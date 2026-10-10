@@ -577,6 +577,17 @@ end
 
 -- ── pracownicy ──
 
+-- Stopień zapisujemy na tej samej pracy, na jakiej gracz jest. Ktoś poza służbą ma
+-- w bazie pracę „off<job>” (patrz resources/duty), więc sama zmiana stopnia nie może
+-- go ściągnąć na służbę – zachowujemy przedrostek (o ile nowy stopień tam istnieje).
+local function keepDutyState(cur, base, grade)
+    if type(cur) ~= 'string' then return base end
+    if cur:match('^off(.+)$') ~= base then return base end
+    local grades = ESX.Jobs[cur] and ESX.Jobs[cur].grades
+    if grades and grades[tostring(grade)] then return cur end
+    return base
+end
+
 H.setGrade = function(c, d)
     local reason = reasonOf(d.reason); if not reason then return err('Podaj powód (min. 5 znaków)') end
     local t, e = target(c, d.ssn); if not t then return err(e) end
@@ -588,7 +599,7 @@ H.setGrade = function(c, d)
     if grade >= boss and c.grade < boss and not c.cross then return err('Stopień szefa może nadać tylko szef') end
     if grade == t.grade then return err('Pracownik ma już ten stopień') end
 
-    data.SetJob(t.identifier, c.job, grade)
+    data.SetJob(t.identifier, keepDutyState(t.job, c.job, grade), grade)
     data.AddPromotion(c.job, t.identifier, t.grade, grade, c.name, reason)
 
     -- stopień w pamięci, żeby panel od razu pokazywał nowy (bez zapytania do bazy)
@@ -1701,6 +1712,8 @@ if Config.Cache.rosterSeconds > 0 then
             Wait(Config.Cache.rosterSeconds * 1000)
             for _, s in pairs(Sessions) do
                 data.RefreshRoster(s.job)
+                -- praca, na którą przełączony jest panel (Config.ManageJobs), też się odświeża
+                if s.ctx and s.ctx ~= s.job then data.RefreshRoster(s.ctx) end
                 -- listy innych prac (Config.ViewJobs) też muszą się odświeżać
                 for _, def in ipairs(data.ViewJobList(s.job)) do data.RefreshRoster(def.job) end
             end
@@ -1711,11 +1724,13 @@ end
 -- Ktoś zmienił pracę: lista pracowników do odświeżenia, panel zamknięty gdy stracił dostęp
 AddEventHandler('esx:setJob', function(src, job, lastJob)
     job, lastJob = baseJob(job), baseJob(lastJob)
-    -- zmiana pracy wpływa też na listy, które podglądają inne prace (Config.ViewJobs)
+    -- zmiana pracy wpływa też na listy, które podglądają lub zarządzają inne prace
+    -- (Config.ViewJobs / Config.ManageJobs)
     for _, name in ipairs({ job, lastJob }) do
         if name and Config.Jobs[name] then
             data.RefreshRoster(name)
             for _, def in ipairs(data.ViewJobList(name)) do data.RefreshRoster(def.job) end
+            for _, def in ipairs(data.ManageJobList(name)) do data.RefreshRoster(def.job) end
         end
     end
 
