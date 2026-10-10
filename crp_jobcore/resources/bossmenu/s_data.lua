@@ -622,10 +622,12 @@ function data.EnsureRow(job, identifier)
 end
 
 -- lista pracowników z tabeli graczy (kto jest w tej pracy)
+--  Uwaga: osoba poza służbą ma w bazie pracę `off<job>` (np. offpolice – patrz resources/duty),
+--  dlatego bierzemy oba warianty nazwy. Bez tego osoby poza służbą wypadały z listy.
 function data.LoadRoster(job)
     local c = get(job)
-    local rows = MySQL.query.await(('SELECT %s, %s FROM %s WHERE %s = ?')
-        :format(USER_COLS, field(GRADE, 'grade'), wrap(USERS), wrap(JOB)), { job })
+    local rows = MySQL.query.await(('SELECT %s, %s FROM %s WHERE %s IN (?, ?)')
+        :format(USER_COLS, field(GRADE, 'grade'), wrap(USERS), wrap(JOB)), { job, 'off' .. job })
 
     local roster = {}
     for _, r in ipairs(rows or {}) do
@@ -1636,10 +1638,23 @@ local function playerJob(x)
     local name = x and x.job and x.job.name
     if type(name) ~= 'string' or name == '' then return nil end
     if Config.Jobs[name] then return name end
-    if Config.AllowOffDuty == false then return name end
+    -- „off<job>” (poza służbą – patrz resources/duty) to ta sama firma. Celowo NIE zależy to
+    -- od Config.AllowOffDuty: ten przełącznik mówi, kto może otworzyć panel (patrz baseJob
+    -- w s_main), a nie kto należy do firmy. Wcześniej osoby poza służbą znikały z list.
     local stripped = name:gsub('^off', '')
     if stripped ~= name and Config.Jobs[stripped] then return stripped end
     return name
+end
+
+-- status gracza. Gdy praca to „off<job>”, jest poza służbą niezależnie od state bagu
+-- (po ponownym wejściu na serwer state bag bywa pusty i osoba wychodziła jako „na służbie”).
+local function dutyStatus(x)
+    local raw = x and x.job and x.job.name
+    if type(raw) == 'string' and raw:sub(1, 3) == 'off' then
+        local base = raw:gsub('^off', '')
+        if base ~= raw and Config.Jobs[base] then return 'off' end
+    end
+    return Config.GetDutyStatus(x.source, x)
 end
 
 --  nil = osoba nie pasuje do tej listy, '' = pasuje, 'Nazwa pracy' = pracuje gdzie indziej
@@ -1659,7 +1674,7 @@ local function buildEmployee(c, job, identifier, u, granted)
         local other = jobMismatch(playerJob(x), job)
         if other == nil then return nil end          -- inna/nieznana praca → nie należy do tej listy
         otherJob = other ~= '' and other or nil
-        grade, status = x.job.grade, otherJob and 'off' or Config.GetDutyStatus(x.source, x)
+        grade, status = x.job.grade, otherJob and 'off' or dutyStatus(x)
     end
 
     local seconds  = m and m.seconds or 0
@@ -1747,7 +1762,7 @@ local function buildRelated(x, job)
         local other = jobMismatch(playerJob(p), job)
         if other == nil then return nil end
         otherJob = other ~= '' and other or nil
-        grade, status = p.job.grade, otherJob and 'off' or Config.GetDutyStatus(p.source, p)
+        grade, status = p.job.grade, otherJob and 'off' or dutyStatus(p)
     end
 
     local m = data.Member(job, x.identifier)
@@ -1760,11 +1775,12 @@ local function buildRelated(x, job)
     }
 end
 
--- lista prac, które ta praca może podglądać: { { job, label }, ... }
-function data.ViewJobList(job)
+-- wspólne czytanie mapy `{ police = true }` z Config.ViewJobs / Config.ManageJobs
+-- (a gdy jej nie ma – z Config.Jobs[job].viewJobs / .manageJobs)
+local function jobMap(job, topLevel, perJob)
     local jc = Config.Jobs[job] or {}
-    local map = Config.ViewJobs and Config.ViewJobs[job]
-    if not map and type(jc.viewJobs) == 'table' then map = jc.viewJobs end
+    local map = topLevel and topLevel[job]
+    if not map and type(perJob) == 'table' then map = perJob end
 
     local out = {}
     if type(map) == 'table' then
@@ -1775,6 +1791,30 @@ function data.ViewJobList(job)
         end
     end
     table.sort(out, function(a, b) return a.label < b.label end)
+    return out
+end
+
+-- lista prac, którymi ta praca ZARZĄDZA (pełny panel): { { job, label }, ... }
+function data.ManageJobList(job)
+    return jobMap(job, Config.ManageJobs, (Config.Jobs[job] or {}).manageJobs)
+end
+
+-- czy `job` może zarządzać pracą `other` (własna robi to zawsze – patrz s_main)
+function data.CanManageJob(job, other)
+    if type(job) ~= 'string' or type(other) ~= 'string' or job == other then return false end
+    for _, def in ipairs(data.ManageJobList(job)) do
+        if def.job == other then return true end
+    end
+    return false
+end
+
+-- lista prac, których pracowników ta praca może podglądać (tylko do czytania)
+--  prace zarządzane pomijamy – są w panelu normalnymi zakładkami (Config.ManageJobs)
+function data.ViewJobList(job)
+    local out = {}
+    for _, def in ipairs(jobMap(job, Config.ViewJobs, (Config.Jobs[job] or {}).viewJobs)) do
+        if not data.CanManageJob(job, def.job) then out[#out + 1] = def end
+    end
     return out
 end
 
@@ -1796,7 +1836,12 @@ local function buildRelatedGroups(job)
 end
 
 function data.Build(s)
-    local job, jc = s.job, Config.Jobs[s.job]
+    -- s.job  = własna praca gracza (jego uprawnienia: ViewJobs / ManageJobs)
+    -- s.ctx  = praca, którą panel aktualnie pokazuje (law może przełączyć się na police/sheriff)
+    --          s_main pilnuje, żeby ctx było dozwolone – tutaj tylko bezpieczne domknięcie
+    local own  = s.job
+    local job  = (type(s.ctx) == 'string' and Config.Jobs[s.ctx]) and s.ctx or own
+    local jc   = Config.Jobs[job]
     local c = data.Prepare(job)
     local orders = data.Orders(job)
 
@@ -1874,17 +1919,36 @@ function data.Build(s)
         for _, p in ipairs(data.Products(job)) do ownProducts[#ownProducts + 1] = p end
     end
 
+    -- ── prace, którymi można zarządzać (przełącznik w panelu) ──
+    --  Zawsze własna praca, dalej prace z Config.ManageJobs / Config.Jobs[job].manageJobs.
+    local canSwitch = { { job = own, label = data.JobLabel(own), own = true } }
+    for _, def in ipairs(data.ManageJobList(own)) do
+        canSwitch[#canSwitch + 1] = { job = def.job, label = def.label }
+    end
+
+    local ownGrade, ownGradeName = tonumber(s.grade) or 0, nil
+    for _, g in ipairs(data.Grades(own)) do if g.id == ownGrade then ownGradeName = g.name end end
+
     return {
         job         = { name = job, label = data.JobLabel(job) },
         me          = { ssn = asText(s.ssn) or '', firstname = s.firstname, lastname = s.lastname,
-                        grade = tonumber(s.grade) or 0 },
+                        grade = ownGrade },
+        -- kontekst pracy: własna czy zarządzana (przełącznik + uprawnienia w UI)
+        manage      = {
+            own          = own,
+            ownLabel     = data.JobLabel(own),
+            ownGradeName = ownGradeName or tostring(ownGrade),
+            ctx          = job,
+            cross        = job ~= own,          -- true = zarządzamy inną pracą (szef tej pracy nie jest chroniony)
+            canSwitch    = canSwitch
+        },
         features    = jc.features or {},
         licenseDefs = jc.licenses or {},
         grades      = data.Grades(job),
         salaryMax   = jc.salaryMax,
         webhooks    = c.webhooks,
         employees   = employees,
-        related     = buildRelatedGroups(job),        -- listy innych prac (tylko do czytania)
+        related     = buildRelatedGroups(own),        -- listy innych prac (tylko do czytania)
         maxPrice    = (Config.Goods and Config.Goods.maxPrice) or 100000000,
         funds       = data.Funds(job),
         transactions = transactions,

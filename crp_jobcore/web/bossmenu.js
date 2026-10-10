@@ -232,6 +232,7 @@ let S = {
     filter: 'all',          // all | duty | break | off
     job: { name: 'job', label: 'Firma' },
     me: { ssn: '', firstname: '—', lastname: '', grade: 0 },
+    manage: { own: 'job', ownLabel: 'Firma', ownGradeName: '', ctx: 'job', cross: false, canSwitch: [] },   // przełącznik pracy (Config.ManageJobs)
     features: { licenses: false, badges: false, records: false },   // włączane przez serwer
     licenseDefs: [],
     grades: [], employees: [], funds: 0, maxPrice: 0, related: [], transactions: [], history: [],
@@ -248,6 +249,14 @@ function normalizeState(s) {
     if (!s.job || typeof s.job !== 'object') s.job = { name: 'job', label: 'Firma' };
     if (typeof s.job.name !== 'string' || !s.job.name) s.job.name = 'job';
     if (!s.me || typeof s.me !== 'object') s.me = { ssn: '', firstname: '—', lastname: '', grade: 0 };
+    if (!s.manage || typeof s.manage !== 'object') s.manage = {};
+    const mg = s.manage;                                  // kontekst pracy: własna + prace z Config.ManageJobs
+    if (typeof mg.own !== 'string' || !mg.own) mg.own = s.job.name;
+    if (typeof mg.ctx !== 'string' || !mg.ctx) mg.ctx = s.job.name;
+    if (typeof mg.ownLabel !== 'string' || !mg.ownLabel) mg.ownLabel = s.job.label || mg.own;
+    if (typeof mg.ownGradeName !== 'string') mg.ownGradeName = '';
+    mg.cross = !!mg.cross;
+    if (!Array.isArray(mg.canSwitch) || !mg.canSwitch.length) mg.canSwitch = [{ job: mg.own, label: mg.ownLabel, own: true }];
     if (!s.features || typeof s.features !== 'object') s.features = {};
     ['licenseDefs', 'grades', 'employees', 'transactions', 'history', 'catalog', 'vehicles', 'orders', 'related'].forEach(k => { if (!Array.isArray(s[k])) s[k] = []; });
     s.funds = Number(s.funds) || 0;
@@ -294,6 +303,16 @@ const P = (from, to, by, reason, at) => ({ from, to, by, reason, at }); // wpis 
 const MOCK = {
     job: { name: 'mechanic', label: 'Warsztat Samochodowy' },
     me: { ssn: '731-04-1001', firstname: 'Adam', lastname: 'Nowak', grade: 4 },
+    // kontekst pracy (Config.ManageJobs): własna + prace, którymi wolno zarządzać.
+    // W DEV kliknięcie zakładki zmienia tylko etykiety – dane zostają z tego mocka.
+    manage: {
+        own: 'mechanic', ownLabel: 'Warsztat Samochodowy', ownGradeName: 'Szef', ctx: 'mechanic', cross: false,
+        canSwitch: [
+            { job: 'mechanic', label: 'Warsztat Samochodowy', own: true },
+            { job: 'police', label: 'Policja LSPD' },
+            { job: 'sheriff', label: 'Sheriff' }
+        ]
+    },
 
     // Funkcje opcjonalne – serwer decyduje, czy są włączone dla danej firmy
     // licenses – licencje · badges – numer odznaki · records – plusy/minusy, pochwały/nagany
@@ -499,6 +518,10 @@ const DEV_CITIZENS = {
 };
 function devReply(event, data) {
     console.log('[bossmenu] ->', event, data);
+    if (event === 'bossmenu:switchJob') {
+        const j = (S.manage?.canSwitch || []).find(x => x.job === data.job);
+        return j ? { ok: true, job: j.job, label: j.label } : { ok: false, error: 'Nie możesz zarządzać tą pracą' };
+    }
     if (event === 'bossmenu:hire') {
         const c = DEV_CITIZENS[data.ssn];
         return c ? { ok: true, employee: { ...c, ssn: data.ssn, status: 'duty' } } : { ok: false, error: 'Nie znaleziono gracza o tym SSN' };
@@ -567,7 +590,14 @@ const EMP = { view: 'list', ssn: null, hireGrade: 0, tab: null, off: { plus: 0, 
 // empTab: 'own' = własna firma, 'rel' = podgląd innych prac (Config.ViewJobs); relJob = wybrana praca
 const navEmp = () => { renderWin('employees'); const b = $('.win[data-win=employees] .body'); if (b) b.scrollTop = 0; };
 const featOn = k => !!S.features?.[k];
-const canManageGrade = e => !isBossGrade(e.grade) && e.ssn !== S.me.ssn;
+/* Kontekst pracy (Config.ManageJobs): własna firma + prace, którymi wolno zarządzać.
+   `cross` = panel pokazuje zarządzaną pracę (np. law ma przełączoną policję). */
+const crossCtx = () => !!S.manage?.cross;
+const canSwitchJobs = () => (S.manage?.canSwitch || []).length > 1;
+const ctxJob = () => S.manage?.ctx || S.job.name;
+const ctxList = () => (canSwitchJobs() ? S.manage.canSwitch : []);
+// praca nadrzędna (law → police/sheriff) może działać także na szefie zarządzanej pracy
+const canManageGrade = e => e.ssn !== S.me.ssn && (crossCtx() || !isBossGrade(e.grade));
 const hasItem = (list, id) => (list || []).find(x => x.id === id);
 const REASON_MIN = 5;      // minimalna długość powodu (awans / wpis)
 const REC = {
@@ -641,17 +671,46 @@ function viewRelated() {
         </table>
     </div>
     <p class="text-[11px] text-slate-500 mt-3">Lista firmy <b class="text-slate-300">${esc(g.label)}</b> · zatrudnianie, zwalnianie i stopnie nadal ustawia tylko ta firma.
-        Zakres podglądu ustawia <span class="font-mono text-slate-400">Config.ViewJobs</span> (albo <span class="font-mono text-slate-400">viewJobs</span> w Config.Jobs).</p>`;
+        Zakres podglądu ustawia <span class="font-mono text-slate-400">Config.ViewJobs</span> (albo <span class="font-mono text-slate-400">viewJobs</span> w Config.Jobs),
+        a <span class="font-mono text-slate-400">Config.ManageJobs</span> (albo <span class="font-mono text-slate-400">manageJobs</span>) daje tej pracy pełne zarządzanie – wtedy pojawia się zakładka przełączająca panel.</p>`;
 }
 
-/* --- przełącznik zakładek w oknie „Pracownicy” --- */
+/* --- przełącznik zakładek w oknie „Pracownicy” ---
+   Dwie rzeczy naraz:
+   1) prace, którymi wolno zarządzać (Config.ManageJobs) – kliknięcie przełącza CAŁY panel
+      na tę pracę (lista, profile, licencje, wpisy – pełne uprawnienia, nie podgląd),
+   2) prace tylko do czytania (Config.ViewJobs) – zakładka „Inne prace”, jak dotychczas. */
 function empTabs() {
-    if (!S.related.length) return '';
-    const n = S.related.reduce((a, g) => a + (g.employees || []).length, 0);
+    const ctx = ctxList();
+    const rel = S.related || [];
+    const n = rel.reduce((a, g) => a + (g.employees || []).length, 0);
+    if (!ctx.length && !rel.length) return '';
+
+    const box = inner => `<div class="shrink-0 flex gap-1 p-1 rounded-xl bg-slate-900 border border-slate-800">${inner}</div>`;
+    const ctxTab = j => {
+        const on = j.job === ctxJob();
+        return `<button data-act="switchJob" data-job="${esc(j.job)}" ${on ? '' : `title="Przełącz panel na: ${esc(j.label)}"`}
+            class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition ${on ? 'bg-brand text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800'}">
+            ${esc(j.label)}${j.own ? `<span class="px-1.5 rounded-md text-[10px] ${on ? 'bg-white/20 text-white' : 'bg-slate-800 text-slate-400'}">moja</span>` : ''}</button>`;
+    };
+    const relTab = `<button data-act="empTab" data-v="rel" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition ${EMP.empTab === 'rel' ? 'bg-brand text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800'}">
+        Inne prace<span class="px-1.5 rounded-md text-[10px] ${EMP.empTab === 'rel' ? 'bg-white/20 text-white' : 'bg-slate-800 text-slate-400'}">${n}</span></button>`;
+
+    // prace zarządzane: zakładki przełączają kontekst panelu („Moja firma” nie jest wtedy potrzebna)
+    if (ctx.length) return box(ctx.map(ctxTab).join('') + (rel.length ? relTab : ''));
+
     const tab = (id, label, count) => `<button data-act="empTab" data-v="${id}" class="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-bold transition ${EMP.empTab === id ? 'bg-brand text-white' : 'text-slate-400 hover:text-white hover:bg-slate-800'}">
         ${label}<span class="px-1.5 rounded-md text-[10px] ${EMP.empTab === id ? 'bg-white/20 text-white' : 'bg-slate-800 text-slate-400'}">${count}</span></button>`;
-    return `<div class="shrink-0 flex gap-1 p-1 rounded-xl bg-slate-900 border border-slate-800">
-        ${tab('own', 'Moja firma', S.employees.length)}${tab('rel', 'Inne prace', n)}</div>`;
+    return box(tab('own', 'Moja firma', S.employees.length) + tab('rel', 'Inne prace', n));
+}
+
+/* pasek „zarządzasz cudzą firmą” – pokazywany w oknach, gdy panel pracuje na innej pracy */
+function ctxBar() {
+    if (!crossCtx()) return '';
+    return `<div class="shrink-0 flex items-center gap-2 px-3 py-2 rounded-xl bg-amber-500/10 border border-amber-500/30 text-[11px] leading-4 text-amber-300">
+        ${icon('shield-check', 'size-4')}
+        <p>Zarządzasz firmą <b class="text-white">${esc(S.job.label)}</b> jako <b class="text-white">${esc(S.manage.ownLabel)}</b> – pełne uprawnienia (pracownicy, stawki, finanse, garaż).</p>
+    </div>`;
 }
 
 const crumb = (...parts) => `
@@ -727,6 +786,7 @@ function viewList() {
         </button>
     </div>
     ${tabs}
+    ${ctxBar()}
     <div class="rounded-xl border border-slate-800 bg-slate-900/50 overflow-x-auto">
         <table class="w-full text-left">
             <thead>
@@ -1025,6 +1085,7 @@ function viewProfile(e) {
 
     return `<div class="h-full flex flex-col gap-2.5">
         <div class="shrink-0">${crumb('Pracownicy', esc(fullName(e)))}</div>
+        ${ctxBar()}
         ${otherJobBar}
         ${header}
         <div class="flex-1 min-h-0 grid gap-3 grid-rows-[minmax(0,1fr)] ${cols.length === 3 ? 'grid-cols-3' : 'grid-cols-1'}">${cols.join('')}</div>
@@ -2892,7 +2953,20 @@ function startWindows() {
 function renderTaskbar() {
     saveLayout();
 
-    $('#tbJob').innerHTML = `<button data-act="power" title="Zamknij (Esc)" class="p-2 rounded-lg text-slate-400 hover:text-white hover:bg-brand transition">${icon('power', 'size-4')}</button>`;
+    // przełącznik pracy (Config.ManageJobs): własna firma + prace, którymi wolno zarządzać
+    const sw = ctxList();
+    const swBtn = j => {
+        const on = j.job === ctxJob();
+        return `<button data-act="switchJob" data-job="${esc(j.job)}" ${on ? '' : `title="Przełącz panel na: ${esc(j.label)}"`}
+            class="flex items-center gap-1.5 px-2.5 h-8 rounded-lg text-[11px] font-bold whitespace-nowrap transition ${on ? 'bg-brand text-white' : 'text-slate-400 hover:text-white hover:bg-white/5'}">${esc(j.label)}</button>`;
+    };
+    const switcher = sw.length > 1 ? `
+        <div class="ml-1 flex items-center gap-0.5 p-0.5 rounded-xl bg-slate-900 border border-slate-800 overflow-hidden">
+            ${sw.map(swBtn).join('')}
+        </div>
+        ${crossCtx() ? `<span class="ml-1 text-[10px] font-bold text-amber-300 whitespace-nowrap">jako ${esc(S.manage.ownLabel)}</span>` : ''}` : '';
+
+    $('#tbJob').innerHTML = `<button data-act="power" title="Zamknij (Esc)" class="p-2 rounded-lg text-slate-400 hover:text-white hover:bg-brand transition">${icon('power', 'size-4')}</button>${switcher}`;
 
     const appBtn = id => {
         const a = APPS[id], w = wins[id];
@@ -2937,7 +3011,8 @@ function renderStart() {
             <div class="size-9 rounded-lg bg-brand text-white font-extrabold text-xs flex items-center justify-center">${esc(initials(fullName(S.me)))}</div>
             <div class="flex-1 min-w-0">
                 <p class="text-xs font-bold text-white truncate">${esc(fullName(S.me))}</p>
-                <p class="text-[11px] text-brand font-semibold truncate">${esc(gradeName(S.me.grade))} · ${esc(S.job.label)}</p>
+                <p class="text-[11px] text-brand font-semibold truncate">${esc(S.manage.ownGradeName || gradeName(S.me.grade))} · ${esc(S.manage.ownLabel)}</p>
+                ${crossCtx() ? `<p class="text-[10px] font-bold text-amber-300 truncate">Zarządzasz: ${esc(S.job.label)}</p>` : ''}
             </div>
             <button data-act="power" title="Zamknij system" class="p-2.5 rounded-xl text-slate-400 hover:text-white hover:bg-brand/90 transition flex items-center justify-center">${icon('power', 'size-5')}</button>
         </div>
@@ -2974,6 +3049,7 @@ function windowFrame(id) {
         <div data-drag class="h-10 shrink-0 flex items-center gap-2 pl-3 pr-1.5 bg-slate-950/70 border-b border-slate-800">
             <span class="size-6 rounded-md border flex items-center justify-center ${TONES[a.tone]}">${icon(a.icon, 'size-3.5')}</span>
             <span class="flex-1 min-w-0 truncate text-xs font-bold text-slate-200">${a.label}</span>
+            <span data-ctx class="shrink-0"></span>
             ${ctl('min', 'minus')}${ctl('max', 'square')}${ctl('close', 'x', 'hover:!bg-brand')}
         </div>
         <div class="body flex-1 min-h-0 overflow-y-auto p-4"></div>
@@ -2997,6 +3073,11 @@ function renderWin(id) {
     const body = w.el.querySelector('.body');
     const top = body.scrollTop;
     body.innerHTML = APPS[w.app].render();
+    // pasek tytułu pokazuje, że okno pracuje na zarządzanej pracy (Config.ManageJobs)
+    const chip = w.el.querySelector('[data-ctx]');
+    if (chip) chip.innerHTML = crossCtx()
+        ? `<span class="px-2 py-0.5 rounded-md bg-amber-500/10 border border-amber-500/30 text-[10px] font-bold text-amber-300 whitespace-nowrap">${esc(S.job.label)} · jako ${esc(S.manage.ownLabel)}</span>`
+        : '';
     fitLists(body); scheduleFit();
     body.scrollTop = top;
 }
@@ -3109,6 +3190,27 @@ function act(type, el) {
 
     switch (type) {
         /* nawigacja w aplikacji Pracownicy */
+        /* przełączenie panelu na inną pracę (Config.ManageJobs: własna + zarządzane) */
+        case 'switchJob': {
+            const job = el.dataset.job;
+            if (!job || job === ctxJob()) return;
+            const def = (S.manage.canSwitch || []).find(x => x.job === job) || { job, label: job };
+            el.disabled = true;
+            request('bossmenu:switchJob', { job }).then(res => {
+                if (!res?.ok) {
+                    el.disabled = false;
+                    return toast(res?.error || 'Nie udało się przełączyć pracy', 'error');
+                }
+                if (!IN_GAME) {     // DEV: atrapa – podmieniamy etykiety, dane zostają z mocka
+                    S.manage.ctx = job; S.manage.cross = job !== S.manage.own;
+                    S.job = { name: job, label: def.label };
+                    resetCtxState(); renderTaskbar(); renderWatermark(); refresh();
+                }
+                toast(`Panel przełączony na: ${def.label}`, 'info');
+            });
+            return;
+        }
+
         case 'openProfile': EMP.view = 'profile'; EMP.ssn = el.dataset.ssn; EMP.off = { plus: 0, commend: 0, promo: 0 }; return navEmp();
         case 'backToList': EMP.view = 'list'; return navEmp();
         case 'empTab': EMP.empTab = el.dataset.v === 'rel' ? 'rel' : 'own'; return navEmp();
@@ -3541,6 +3643,7 @@ function hideUI() { const s = $('#screen'); if (!s) return; s.setAttribute('hidd
 function openMenu(data) {
     if (data) S = normalizeState({ ...S, ...data, search: '', filter: 'all', history: data.history || [] });
     EMP.view = 'list'; EMP.ssn = null;
+    resetCtxState();        // każde otwarcie panelu startuje na własnej pracy (serwer też tak ustawia sesję)
     showUI();
     try {
         renderIcons(); refresh();
@@ -3559,8 +3662,22 @@ function closeMenu() {
 // FiveM: ui.openUI(action, data) -> SendNUIMessage({ action, data }) = otwarcie; 'update' { data } / 'notify' { text, tone };
 //        akcja bez `data` (np. ui.CloseUI(action) albo 'close') = zamknięcie. Zamknięcie z UI: POST /close { action, success }
 let PENDING_REFRESH = false;
+
+/* Zmiana pracy w panelu (Config.ManageJobs) = inna firma, inne dane, inne koszyki.
+   Czyścimy stan okien, żeby nie zostały np. pozycje z garażu policji po powrocie do law. */
+function resetCtxState() {
+    EMP.view = 'list'; EMP.ssn = null; EMP.empTab = 'own'; EMP.relJob = null; EMP.hireGrade = 0;
+    EMP.off = { plus: 0, commend: 0, promo: 0 };
+    GAR.cart = []; GAR.search = ''; GAR.csearch = ''; GAR.filter = 'all'; GAR.cat = 'all'; GAR.tab = 'vehicles';
+    SHOP.cart = {}; SHOP.note = {}; SHOP.sup = null; SHOP.search = ''; SHOP.cat = 'all'; SHOP.busy = false;
+    S.search = ''; S.filter = 'all';
+    closeModal();
+}
+
 function applyUpdate(data) {
+    const prevCtx = S.manage?.ctx;
     S = normalizeState({ ...S, ...data });
+    if (prevCtx && S.manage.ctx !== prevCtx) resetCtxState();                                        // przełączenie pracy
     if (EMP.view !== 'list' && EMP.ssn && !getEmp(EMP.ssn)) { EMP.view = 'list'; EMP.ssn = null; }   // pracownik zwolniony / zniknął z listy
     const ae = document.activeElement;
     // nie przebudowuj okien, gdy gracz akurat coś wpisuje – odśwież po opuszczeniu pola

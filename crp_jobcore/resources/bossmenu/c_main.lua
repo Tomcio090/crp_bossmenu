@@ -466,6 +466,7 @@ end)
 
 -- ── NUI -> serwer ──
 local ACTIONS = {
+    'switchJob',
     'setGrade', 'hire', 'fire', 'setBadge', 'addRecord', 'voidRecord', 'setLicense', 'resetHours', 'resetAllHours', 'setNote',
     'setSalary', 'setWebhooks', 'testWebhook', 'deposit', 'withdraw',
     'orderVehicles', 'cancelOrder', 'assignVehicle', 'revokeVehicle',

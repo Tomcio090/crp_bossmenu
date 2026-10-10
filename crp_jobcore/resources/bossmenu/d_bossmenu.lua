@@ -103,7 +103,9 @@ Config.Jobs = {
         licenses  = {
             { id = 'swat', label = 'Jednostka specjalna', icon = 'shield', desc = 'Udział w akcjach specjalnych.' }
         },
-        viewJobs  = { police = true, sheriff = true },
+        -- praca „law” przełącza panel na policję i szeryfa i zarządza nimi jak swoją firmą
+        -- (ludzie, stawki, finanse, garaż, zamówienia, historia) — to samo co Config.ManageJobs.law
+        manageJobs = { police = true, sheriff = true },
     },
 
     ambulance = {
@@ -137,13 +139,14 @@ Config.Jobs = {
 --  Wartości mcoords / bossmenucoords / chaircoords możesz podejrzeć w Config.Debug = true
 -- ─────────────────────────────────────────────────────────────
     -- ── PRZYKŁADY na Twój przypadek (odkomentuj, jeśli masz takie prace w ESX) ──
-    -- Praca „law” widzi listę policji i szeryfa – szczegóły ustawia się w Config.ViewJobs poniżej.
+    -- Praca „law” ZARZĄDZA policją i szeryfem (pełny panel: ludzie, stawki, finanse, garaż).
+    -- Można to ustawić tutaj (manageJobs) albo w Config.ManageJobs poniżej.
     --['law'] = {
     --    minGrade = 0,
     --    salaryMax = 250,
     --    features  = { licenses = true, badges = true, records = true },
     --    licenses  = {},
-    --    viewJobs  = { police = true, sheriff = true }      -- to samo co w Config.ViewJobs.law
+    --    manageJobs = { police = true, sheriff = true }     -- to samo co w Config.ManageJobs.law
     --},
     --['sheriff'] = {
     --    minGrade = 0,
@@ -157,12 +160,28 @@ Config.Jobs = {
 --
 --  Praca po lewej widzi listę pracowników z prac po prawej – bez możliwości
 --  zatrudniania, zwalniania czy zmiany stopnia (to nadal robi tylko ich własna firma).
---  Przykład z życia: praca „law” widzi listę policji i szeryfa.
+--  Do czytania można też dodać `viewJobs` w Config.Jobs[job].
 -- ─────────────────────────────────────────────────────────────
 Config.ViewJobs = {
-    ['law'] = { police = true, sheriff = true },
     --['police'] = { sheriff = true },          -- policja widzi szeryfów
     --['sheriff'] = { police = true },          -- i odwrotnie
+}
+
+-- ─────────────────────────────────────────────────────────────
+--  ZARZĄDZANIE INNYMI PRACAMI (pełny panel, nie podgląd)
+--
+--  Praca po lewej może przełączyć panel na pracę po prawej i zarządzać nią
+--  dokładnie tak, jakby to była jej własna firma: pracownicy (zatrudnianie,
+--  zwalnianie, stopnie, odznaki, licencje, wpisy, notatki, godziny), stawki,
+--  finanse, garaż, zamówienia i historia. Można też wpisać `manageJobs`
+--  bezpośrednio w Config.Jobs[job] (tak jest ustawiona praca „law”).
+--
+--  Uwaga: szef zarządzanej pracy (najwyższy stopień) nie jest chroniony –
+--  praca nadrzędna może go zdegradować lub zwolnić. Chroniona jest tylko
+--  własna osoba (nie da się wykonać akcji na sobie).
+-- ─────────────────────────────────────────────────────────────
+Config.ManageJobs = {
+    --['law'] = { police = true, sheriff = true },   -- to samo co Config.Jobs.law.manageJobs
 }
 
 Config.Locations = {
