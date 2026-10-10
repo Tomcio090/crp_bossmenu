@@ -310,6 +310,8 @@ end)
 
 
 -- kontekst gracza albo nil, powód
+--  `job` to praca, na której aktualnie pracuje panel (s.ctx) – dla prac z Config.ManageJobs
+--  może to być inna praca niż własna gracza (wtedy c.cross = true).
 local function context(src)
     local s = Sessions[src]
     if not s then return nil, 'Panel nie jest otwarty' end
@@ -320,8 +322,17 @@ local function context(src)
     end
 
     s.grade = x.job.grade
+
+    -- prawo do zarządzania inną pracą sprawdzamy przy KAŻDEJ akcji (konfiguracja mogła się zmienić)
+    local ctx = s.ctx or s.job
+    if ctx ~= s.job and not data.CanManageJob(s.job, ctx) then
+        ctx = s.job
+        s.ctx = s.job
+    end
+
     return {
-        src = src, xPlayer = x, identifier = s.identifier, job = s.job, grade = s.grade,
+        src = src, xPlayer = x, identifier = s.identifier, job = ctx, own = s.job,
+        cross = ctx ~= s.job, grade = s.grade,
         ssn = s.ssn, name = ('%s %s'):format(s.firstname, s.lastname)
     }
 end
@@ -337,7 +348,10 @@ end
 
 function Server.NotifyJob(job, text, tone)
     for src, s in pairs(Sessions) do
-        if s.job == job then TriggerClientEvent('crp_bossmenu:client:notify', src, text, tone or 'info') end
+        -- gracz, który ma w panelu przełączoną tę pracę (Config.ManageJobs), też dostaje powiadomienie
+        if s.job == job or s.ctx == job then
+            TriggerClientEvent('crp_bossmenu:client:notify', src, text, tone or 'info')
+        end
     end
 end
 
@@ -407,7 +421,8 @@ function Server.Open(src)
     end
 
     Sessions[src] = {
-        job = job, identifier = x.identifier,
+        job = job, ctx = job,                   -- ctx = praca pokazywana w panelu (patrz Server.Open / switchJob)
+        identifier = x.identifier,
         ssn = me.ssn or x.identifier, firstname = me.firstname or '', lastname = me.lastname or '', grade = x.job.grade
     }
 
@@ -436,7 +451,8 @@ local function flushRefresh()
     pendingRefresh = {}
 
     for src, s in pairs(Sessions) do
-        if jobs['*'] or jobs[s.job] then push(src) end
+        -- własna praca gracza albo praca, na którą ma przełączony panel (Config.ManageJobs)
+        if jobs['*'] or jobs[s.job] or jobs[s.ctx] then push(src) end
     end
 end
 
@@ -490,7 +506,7 @@ local function gradeName(job, grade)
     return '—'
 end
 
--- pracownik tej samej firmy, znaleziony po SSN
+-- pracownik firmy, na której pracuje panel (c.job), znaleziony po SSN
 local function target(c, ssn)
     ssn = str(ssn, 40)
     if not ssn or ssn == '' then return nil, 'Podaj SSN pracownika' end
@@ -504,14 +520,22 @@ local function target(c, ssn)
     t.src = x and x.source or nil
     t.name = fullName(t)
 
-    if t.job ~= c.job then return nil, 'Ta osoba nie pracuje w Twojej firmie' end
-    return t
+    -- praca „off<job>” (poza służbą) liczy się tak samo jak bazowa – inaczej nie dałoby się
+    -- zdegradować ani zwolnić kogoś, kto właśnie zeszedł ze służby
+    if baseJob(t.job) == c.job then return t end
+
+    -- wiersz w tabeli graczy bywa nieaktualny (np. ktoś jest offline) – ratuje nas lista firmy
+    if data.Roster(c.job)[t.identifier] then return t end
+
+    return nil, c.cross and ('Ta osoba nie pracuje w firmie %s'):format(data.JobLabel(c.job))
+                      or 'Ta osoba nie pracuje w Twojej firmie'
 end
 
--- stopnia i zwolnienia nie robimy na szefie ani na sobie
+-- stopnia i zwolnienia nie robimy na sobie; w obrębie własnej firmy chronimy też szefa.
+-- Praca nadrzędna (c.cross, np. law → police) może działać również na szefie zarządzanej pracy.
 local function manageable(c, t)
     if t.identifier == c.identifier then return 'Nie możesz wykonać tej akcji na sobie' end
-    if t.grade >= data.BossGrade(c.job) then return 'Nie można wykonać tej akcji na szefie' end
+    if not c.cross and t.grade >= data.BossGrade(c.job) then return 'Nie można wykonać tej akcji na szefie' end
 end
 
 local function reasonOf(v)
@@ -528,6 +552,29 @@ local function summary(items)
     return table.concat(parts, ', ')
 end
 
+-- ── kontekst pracy (Config.ManageJobs / Config.Jobs[job].manageJobs) ──
+--  Panel gracza działa na jednej pracy naraz. Własna gracza jest domyślna, a prace
+--  z manageJobs (np. law → police, sheriff) można przełączać i zarządzać nimi
+--  dokładnie tak samo (ludzie, stawki, finanse, garaż, zamówienia, historia).
+H.switchJob = function(c, d)
+    local s = Sessions[c.src]
+    if not s then return err('Panel nie jest otwarty') end
+
+    local target = str(d.job, 40)
+    if not target or not Config.Jobs[target] then return err('Nieprawidłowa praca') end
+    if target ~= s.job and not data.CanManageJob(s.job, target) then
+        return err('Nie możesz zarządzać tą pracą')
+    end
+    if target == (s.ctx or s.job) then return { ok = true, job = target } end
+
+    s.ctx = target
+    -- dane nowej pracy muszą dotrzeć do UI PO odpowiedzi na tę akcję
+    SetTimeout(80, function()
+        if Sessions[c.src] then push(c.src) end
+    end)
+    return { ok = true, job = target, label = data.JobLabel(target) }
+end
+
 -- ── pracownicy ──
 
 H.setGrade = function(c, d)
@@ -538,7 +585,7 @@ H.setGrade = function(c, d)
     local grade, boss = int(d.grade, 0), data.BossGrade(c.job)
     local jobGrades = ESX.Jobs[c.job] and ESX.Jobs[c.job].grades
     if not grade or not (jobGrades and jobGrades[tostring(grade)]) then return err('Nieprawidłowy stopień') end
-    if grade >= boss and c.grade < boss then return err('Stopień szefa może nadać tylko szef') end
+    if grade >= boss and c.grade < boss and not c.cross then return err('Stopień szefa może nadać tylko szef') end
     if grade == t.grade then return err('Pracownik ma już ten stopień') end
 
     data.SetJob(t.identifier, c.job, grade)
@@ -561,9 +608,12 @@ H.hire = function(c, d)
 
     local t = data.FindBySsn(ssn); if not t then return err('Nie znaleziono gracza o tym SSN') end
     local x = ESX.GetPlayerFromIdentifier(t.identifier)
-    local job = x and x.job.name or t.job
+    local job = baseJob(x and x.job.name or t.job)      -- „off<job>” (poza służbą) liczymy jak bazową pracę
 
-    if job == c.job then return err('Ta osoba już u Ciebie pracuje') end
+    if job == c.job then
+        return err(c.cross and ('Ta osoba już pracuje w firmie %s'):format(data.JobLabel(c.job))
+                          or 'Ta osoba już u Ciebie pracuje')
+    end
     if Config.HireOnlyUnemployed and job ~= Config.Unemployed.job then return err('Ten gracz pracuje w innej firmie') end
 
     local grade, boss = int(d.grade, 0), data.BossGrade(c.job)
@@ -1508,7 +1558,8 @@ end)
 -- ═════════════════════════════════════════════════════════════
 --  DYSPOZYTOR AKCJI
 -- ═════════════════════════════════════════════════════════════
-local NO_REFRESH = { testWebhook = true }
+-- switchJob sam wysyła paczkę nowej pracy (referencja zdążyłaby wskazywać starą pracę)
+local NO_REFRESH = { testWebhook = true, switchJob = true }
 
 RegisterNetEvent('crp_bossmenu:server:req', function(reqId, action, d)
     local src = playerSrc(source)
