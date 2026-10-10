@@ -1,63 +1,30 @@
 Config = {}
 
--- ── DIAGNOSTYKA ───────────────────────────────────────────────────────────────
-
--- Wypisuje w konsoli (F8) każdy krok: start zadania, przypięcie auta, oddanie, baza.
 Config.Debug = false
-
--- ── KTO MOŻE PRACOWAĆ ─────────────────────────────────────────────────────────
---  nano_cd NIE MA własnej służby. Korzysta z systemu duty z `crp_jobcore`
---  (przełączanie `centra_autos` ⇄ `offcentra_autos`, punkt duty z targetem –
---  to samo, co dla `police` ⇄ `offpolice`). Służba jest czytana z crp_jobcore
---  (export `crp_jobcore:IsOnDuty`, a gdy go nie ma – ze state bagu `duty`),
---  więc nie ma tu żadnego drugiego przełącznika ani komendy.
-
--- Nazwa pracy firmy, która wozi pojazdy (wersja „dzienna”, bez `off`).
--- Domyślnie ta sama firma, która przyjmuje zamówienia (Config.VehicleShop.supplierJob
--- w `d_bossmenu.lua`). Puste '' = może wozić każdy (tryb testów).
 Config.Job = 'centra_autos'
-
--- true = wozić może tylko osoba NA SŁUŻBIE (czyli ta, która przeszła na służbę
--- w systemie duty z crp_jobcore). false = wystarczy sama praca, służba nie jest wymagana.
 Config.RequireDuty = true
 
--- ── BAZA CD (POD CAR DEALEREM) ────────────────────────────────────────────────
--- Tu pojawia się laweta (przyczepa `tr2`) razem z autem do ciągnięcia — ale tylko
--- wtedy, gdy jest jakieś zamówienie do zawiezienia. Tu też skrypt „sprząta” zestaw.
-
 Config.Base = {
+    coords = vector3(-914.0663, -1171.6893, 4.9069),
 
-    -- Środek bazy pod car dealerem (blip, znacznik, decyzja o sprzątaniu). PODMIEŃ.
-    coords = vector3(461.0, -1002.0, 30.4),
-
-    -- Promień strefy bazy (marker, auto-służba, „jesteś w bazie” w podpowiedziach).
     radius = 45.0,
 
-    -- Blip bazy na mapie.
     blip = { sprite = 477, color = 5, scale = 0.9, label = 'CD – baza (car dealer)' },
 
-    -- Znacznik (marker) na ziemi w bazie.
     marker = { type = 1, color = { r = 90, g = 160, b = 255, a = 90 }, scale = { x = 6.0, y = 6.0, z = 1.0 } },
 
-    -- Gdzie ma stanąć przyczepa `tr2` (tryb 'spawn'). PODMIEŃ (x, y, z, heading).
-    trailerCoords = vector4(461.0, -1012.0, 30.2, 0.0),
+    trailerCoords = vector4(-914.1580, -1163.6470, 4.8340, 206.5749),
 
-    -- Gdzie ma stanąć auto do ciągnięcia (gdy Config.Truck.mode = 'spawn'). PODMIEŃ.
-    truckCoords = vector4(461.0, -1018.0, 30.2, 0.0),
+    truckCoords = vector4(-910.7054, -1169.7985, 4.9047, 210.5949),
 
-    -- true = gdy nie ma żadnego zadania, laweta jest pusta i odejdziesz od niej,
-    -- zestaw (przyczepa + ciężarówka) znika. false = zostaje w świecie.
     removeWhenIdle = true,
-
-    -- Jak daleko musisz odejść od przyczepy, żeby skrypt mógł ją usunąć (w metrach).
+.
     removeDistance = 25.0,
 }
 
 -- ── LAWETA (PRZYCZEPA `tr2`) ──────────────────────────────────────────────────
 
 Config.Trailer = {
-
-    -- Model przyczepy, na którą ładujemy auta z zamówienia.
     model = 'tr2',
 
     -- 'spawn'  = skrypt stawia przyczepę w Config.Base.trailerCoords (pod car dealerem).
@@ -137,7 +104,7 @@ Config.Truck = {
 Config.Docks = {
 
     -- Środek doków (blip, znacznik, podpowiedzi). PODMIEŃ.
-    coords = vector3(461.0, -1002.0, 30.4),
+    coords = vector3(1221.3972, -3000.8982, 5.865),
 
     -- Promień strefy doków – w niej pokazujemy podpowiedzi o załadunku.
     radius = 70.0,
@@ -155,7 +122,7 @@ Config.Docks = {
         model = 's_m_m_dockwork_01',
 
         -- Gdzie ma stać ped: x, y, z, heading. PODMIEŃ.
-        coords = vector4(460.0, -1000.0, 30.4, 180.0),
+        coords = vector4(1221.3972, -3000.8982, 5.8654, 89.9467),
 
         -- Scenka, którą odgrywa ped ('' = stoi bez scenki).
         scenario = 'WORLD_HUMAN_CLIPBOARD',
@@ -188,9 +155,9 @@ Config.Docks = {
     --  x, y, z, heading. Jedno miejsce = jedno auto (skrypt wybiera wolne).
     --  Ustaw ich co najmniej tyle, ile masz gniazd na lawecie. PODMIEŃ.
     spawnPoints = {
-        vector4(470.0, -1010.0, 30.2, 90.0),
-        vector4(470.0, -1016.0, 30.2, 90.0),
-        vector4(470.0, -1022.0, 30.2, 90.0),
+        vector4(1214.3400, -2990.2830, 5.8654, 47.2294),
+        vector4(1214.3420, -2981.7222, 5.8654, 71.2091),
+        vector4(1214.7487, -2978.8403, 5.8654, 53.5430),
     },
 
     -- Event do kluczyków, który ma dostać pracownik po pobraniu auta.

@@ -348,12 +348,24 @@ end
 local function nearLocation(src, job)
     if not Config.RequireLocation then return true end
     local pos = GetEntityCoords(GetPlayerPed(src))
+    
     for _, loc in pairs(Config.Locations) do
-        -- klient aktywuje punkt z `distance` (c_main.lua), `radius` (jeśli ustawiony) zawęża tylko serwer
-        if loc.job == job and #(pos - vec3(loc.mcoords.x, loc.mcoords.y, loc.mcoords.z)) <= (loc.radius or loc.distance or 2.0) + 2.0 then
-            return true
+        local hasJob = false
+        
+        if loc.job and loc.job == job then
+            hasJob = true
+        elseif loc.jobs and loc.jobs[job] then
+            hasJob = true
+        end
+        
+        if hasJob then
+            local maxDistance = (loc.radius or loc.distance or 2.0) + 2.0
+            if #(pos - vec3(loc.mcoords.x, loc.mcoords.y, loc.mcoords.z)) <= maxDistance then
+                return true
+            end
         end
     end
+    
     return false
 end
 
