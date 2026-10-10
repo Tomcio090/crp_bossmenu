@@ -54,7 +54,7 @@ local function baseJob(job)
     return job
 end
 
-local chairModel = `sf_prop_sf_offchair_exec_01a`
+local chairModel = 'sf_prop_sf_offchair_exec_01a'
 local animDict = 'anim@scripted@player@fix_agy_ig6_office_chair_entry@right@male@'
 
 -- fazy animacji krzesła; `clip` = klip na postać, `chair` = klip na krzesło (przedmiot)

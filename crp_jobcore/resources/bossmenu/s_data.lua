@@ -93,12 +93,37 @@ local USER_COLS = table.concat({
     field(column('phone'), 'phone')
 }, ', ')
 
+-- ── TELEFONY (Config.Db.phones) ──────────────────────────────────────────────
+--  Numer pracownika bierzemy z tabeli skryptu telefonu (LB Phone: `phone_phones`)
+--  i dopasowujemy po charidzie gracza – tym samym, który zapisujemy w
+--  ..._members.identifier. Opis wszystkich opcji: d_bossmenu.lua (Config.Db.phones).
+--  Nazwy z configu skracamy tutaj raz, żeby dalej już nie grzebać w tabeli.
+local function dbOpt(tbl, key, default)
+    if type(tbl) ~= 'table' then return nil end
+    local v = tbl[key]
+    if v == nil then return default end
+    if v == false or v == '' then return nil end      -- false / '' = ta opcja jest wyłączona
+    return v
+end
+
+local PHONES       = type(DB.phones) == 'table' and DB.phones or nil
+local PHONE_TABLE  = dbOpt(PHONES, 'table', 'phone_phones')   -- nil = nie czytamy telefonów
+local PHONE_NUMBER = dbOpt(PHONES, 'number', 'phone_number')
+local PHONE_LAST   = dbOpt(PHONES, 'lastSeen', 'last_seen')   -- '' = bez wyboru „ostatnio używany”
+local PHONE_ORDER  = dbOpt(PHONES, 'order', 'id')             -- remis w czasie: większa wartość wygrywa
+local PHONE_ID     = dbOpt(PHONES, 'id', 'id')                -- kolumna z charidem (tryb bez metadanych)
+local PHONE_OWNER  = dbOpt(PHONES, 'owner', 'owner_id')       -- kolumna z charidem (tryb z metadanymi)
+local PHONE_MATCH  = dbOpt(PHONES, 'match', 'auto')           -- auto | id | owner
+
 -- informacja w konsoli o kolumnach, których nie ma w Config.Db (żeby nie było cichej niespodzianki).
 -- `users`, `identifier`, `job`, `grade` mają sensowne wartości domyślne, więc o nich nie krzyczymy.
+-- O `phone` nie krzyczymy, gdy numery bierzemy z tabeli telefonu – tam po prostu ich nie ma.
 do
     local missing = {}
     for _, key in ipairs({ 'firstname', 'lastname', 'ssn', 'phone', 'userLicenses', 'licenses' }) do
-        if DB[key] == nil or DB[key] == false or DB[key] == '' then missing[#missing + 1] = key end
+        if not (key == 'phone' and PHONE_TABLE) and (DB[key] == nil or DB[key] == false or DB[key] == '') then
+            missing[#missing + 1] = key
+        end
     end
     if #missing > 0 then
         print(('^3[crp_bossmenu]^7 Config.Db bez kolumn: %s – te pola będą puste w panelu (nie blokuje działania)')
@@ -575,6 +600,183 @@ local function get(job)
 end
 
 
+-- ═════════════════════════════════════════════════════════════
+--  TELEFONY (tabela skryptu telefonu – Config.Db.phones)
+--
+--  Numer bierzemy po charidzie gracza (identifier), a gdy postać ma ich kilka –
+--  ten używany najpóźniej (`lastSeen`); przy remisie wygrywa większe `order`.
+--
+--  LB Phone trzyma charid w dwóch różnych kolumnach, zależnie od trybu:
+--    * bez metadanych telefonów-przedmiotów: `id`       = identifier gracza,
+--    * z metadanymi:                         `owner_id` = identifier gracza
+--                                             (`id` to wtedy unikalny numer telefonu),
+--  dlatego domyślnie szukamy w obu kolumnach (`match = 'auto'`). Gdy tabeli nie ma
+--  albo brakuje którejś kolumny, próbujemy kolejnych, uboższych wariantów zapytania,
+--  a gdy i to zawiedzie – zostaje numer z tabeli graczy (Config.Db.phone).
+--  Nic tutaj nie wysypuje zasobu: najwyżej jednorazowy komunikat w konsoli.
+-- ═════════════════════════════════════════════════════════════
+
+-- tryby dopasowania do charidu (w kolejności prób)
+local function phoneModes()
+    if PHONE_MATCH == 'id'    then return PHONE_ID    and { 'id' }    or {} end
+    if PHONE_MATCH == 'owner' then return PHONE_OWNER and { 'owner' } or {} end
+
+    local out = {}
+    if PHONE_ID and PHONE_OWNER then out[#out + 1] = 'auto' end
+    if PHONE_ID                then out[#out + 1] = 'id'    end
+    if PHONE_OWNER             then out[#out + 1] = 'owner' end
+    return out
+end
+
+-- warianty zapytania: każdy tryb × (z `lastSeen` i `order` → bez nich, gdy kolumny brakuje)
+local PHONE_SPECS = {}
+if PHONE_TABLE and PHONE_NUMBER then
+    for _, mode in ipairs(phoneModes()) do
+        PHONE_SPECS[#PHONE_SPECS + 1] = { mode = mode, full = true }
+        PHONE_SPECS[#PHONE_SPECS + 1] = { mode = mode, full = false }
+    end
+end
+
+local phoneSpec   -- wariant, który zadziałał (cache – nie próbujemy od nowa przy każdym pytaniu)
+local phoneDead   -- true = tabeli nie da się czytać; numery zostają z tabeli graczy
+
+-- „10” ma być nowsze niż „9”, więc wartości liczbowe porównujemy jak liczby
+local function newerOrd(a, b)
+    if a == nil or a == '' then return false end
+    if b == nil or b == '' then return true end
+    local na, nb = tonumber(a), tonumber(b)
+    if na and nb then return na > nb end
+    return a > b
+end
+
+-- jedno zapytanie o numery dla porcji charidów; zwraca wiersze albo nil + powód
+local function queryPhones(spec, group)
+    local marks = {}
+    for i = 1, #group do marks[i] = '?' end
+    local list = table.concat(marks, ', ')
+
+    local where, params
+    if spec.mode == 'id' then
+        where, params = ('%s IN (%s)'):format(wrap(PHONE_ID), list), group
+    elseif spec.mode == 'owner' then
+        where, params = ('%s IN (%s)'):format(wrap(PHONE_OWNER), list), group
+    else
+        -- tryb auto: ten sam charid sprawdzamy w obu kolumnach (parametry lecą dwa razy)
+        where = ('(%s IN (%s) OR %s IN (%s))'):format(wrap(PHONE_ID), list, wrap(PHONE_OWNER), list)
+        params = {}
+        for _ = 1, 2 do
+            for i = 1, #group do params[#params + 1] = group[i] end
+        end
+    end
+
+    -- kolumnę z charidem bierzemy tylko z tej strony, po której szukamy – dzięki temu
+    -- zadziała też tabela, która ma tylko `owner_id` (albo tylko `id`)
+    local cols = {
+        ('%s AS phone_number'):format(wrap(PHONE_NUMBER)),
+        (PHONE_ID and spec.mode ~= 'owner') and ('%s AS by_id'):format(wrap(PHONE_ID)) or 'NULL AS by_id',
+        (PHONE_OWNER and spec.mode ~= 'id') and ('%s AS by_owner'):format(wrap(PHONE_OWNER)) or 'NULL AS by_owner',
+        (spec.full and PHONE_LAST)  and ('UNIX_TIMESTAMP(%s) AS used_at'):format(wrap(PHONE_LAST)) or 'NULL AS used_at',
+        (spec.full and PHONE_ORDER) and ('%s AS ord'):format(wrap(PHONE_ORDER)) or 'NULL AS ord'
+    }
+
+    local sql = ('SELECT %s FROM %s WHERE %s'):format(table.concat(cols, ', '), wrap(PHONE_TABLE), where)
+    -- pcall, bo oxmysql przy złej tabeli/kolumnie potrafi rzucić błędem (albo zwrócić nil)
+    local ok, rows = pcall(function() return MySQL.query.await(sql, params) end)
+    if not ok or not rows then return nil, tostring(rows or 'brak odpowiedzi z bazy') end
+    return rows
+end
+
+-- wybór jednego numeru na charid: najnowszy `used_at`, przy remisie większe `ord`
+local function pickPhones(rows, wanted, spec)
+    local best = {}
+    for _, r in ipairs(rows or {}) do
+        -- charid bierzemy z tej kolumny, w której trafiliśmy (w trybie auto bywa różnie)
+        local charid
+        if spec.mode ~= 'owner' then
+            local byId = asText(r.by_id)
+            if byId and wanted[byId] then charid = byId end
+        end
+        if not charid and spec.mode ~= 'id' then
+            local byOwner = asText(r.by_owner)
+            if byOwner and wanted[byOwner] then charid = byOwner end
+        end
+
+        local number = asText(r.phone_number)
+        if charid and number and number ~= '' then
+            local at  = tonumber(r.used_at) or 0      -- brak `lastSeen` = jak najstarszy
+            local ord = asText(r.ord) or ''
+            local b = best[charid]
+            if not b or at > b.at or (at == b.at and newerOrd(ord, b.ord)) then
+                best[charid] = { number = number, at = at, ord = ord }
+            end
+        end
+    end
+
+    local out = {}
+    for charid, rec in pairs(best) do out[charid] = rec.number end
+    return out
+end
+
+-- mapa: charid → numer telefonu (pusta, gdy tabela telefonów nie jest skonfigurowana)
+local function loadPhones(identifiers)
+    local out = {}
+    if phoneDead or #PHONE_SPECS == 0 then return out end
+
+    -- bez duplikatów (lista pracowników bywa długa, a IN (...) nie potrzebuje powtórzeń)
+    local wanted, ids = {}, {}
+    for _, id in ipairs(identifiers or {}) do
+        if type(id) == 'string' and id ~= '' and not wanted[id] then
+            wanted[id] = true
+            ids[#ids + 1] = id
+        end
+    end
+    if #ids == 0 then return out end
+
+    -- wariant, który zadziałał ostatnio, próbujemy jako pierwszy
+    local specs = PHONE_SPECS
+    if phoneSpec then
+        specs = { phoneSpec }
+        for _, s in ipairs(PHONE_SPECS) do
+            if s ~= phoneSpec then specs[#specs + 1] = s end
+        end
+    end
+
+    for _, group in ipairs(chunks(ids, 250)) do
+        local rows, lastError
+        for _, spec in ipairs(specs) do
+            rows, lastError = queryPhones(spec, group)
+            if rows then
+                phoneSpec = spec
+                break
+            end
+        end
+
+        if not rows then
+            phoneDead = true
+            print(('^3[crp_bossmenu]^7 nie mogę czytać numerów z `%s` (%s) – w panelu zostanie numer z tabeli graczy')
+                :format(tostring(PHONE_TABLE), tostring(lastError)))
+            return out
+        end
+
+        local picked = pickPhones(rows, wanted, phoneSpec)
+        for id, number in pairs(picked) do out[id] = number end
+    end
+    return out
+end
+
+-- numery telefonów dla listy charidów: { [identifier] = numer } (patrz Config.Db.phones)
+function data.Phones(identifiers)
+    if type(identifiers) ~= 'table' then return {} end
+    return loadPhones(identifiers)
+end
+
+-- numer jednego gracza (użycie: zatrudnianie, awans – gdy nie ma go na liście pracowników)
+function data.Phone(identifier)
+    if type(identifier) ~= 'string' or identifier == '' then return nil end
+    return loadPhones({ identifier })[identifier]
+end
+
+
 -- ───────── wczytywanie ─────────
 
 -- pracownicy z tabeli members (odznaki, godziny, notatki, zatrudnienie)
@@ -629,10 +831,21 @@ function data.LoadRoster(job)
     local rows = MySQL.query.await(('SELECT %s, %s FROM %s WHERE %s IN (?, ?)')
         :format(USER_COLS, field(GRADE, 'grade'), wrap(USERS), wrap(JOB)), { job, 'off' .. job })
 
+    -- numery telefonów z tabeli skryptu telefonu (Config.Db.phones): jedno zapytanie na porcję,
+    -- a gdy postać ma kilka numerów – ten używany najpóźniej. Numer z tej tabeli wygrywa
+    -- z kolumną `phone` z tabeli graczy.
+    local identifiers = {}
+    for _, r in ipairs(rows or {}) do
+        local id = asText(r.identifier)
+        if id then identifiers[#identifiers + 1] = id end
+    end
+    local phones = loadPhones(identifiers)
+
     local roster = {}
     for _, r in ipairs(rows or {}) do
         r.ssn = asText(r.ssn) or r.identifier          -- SSN jako tekst (patrz asText)
         r.grade = tonumber(r.grade) or 0
+        r.phone = phones[r.identifier] or r.phone
         roster[r.identifier] = r
     end
     c.roster, c.rosterLoaded, c.rosterStale = roster, true, false
@@ -1192,6 +1405,9 @@ local function normalizePlayer(row)
     if not row then return nil end
     row.ssn = asText(row.ssn) or asText(row.identifier)
     row.grade = tonumber(row.grade) or 0
+    -- numer z tabeli skryptu telefonu (Config.Db.phones) ma pierwszeństwo nad kolumną z users
+    local phone = data.Phone(row.identifier)
+    if phone then row.phone = phone end
     return row
 end
 

@@ -31,7 +31,7 @@ Config.Db = {
     firstname  = 'firstname',
     lastname   = 'lastname',
     ssn        = 'ssn',           -- brak kolumny? zakomentuj – zamiast SSN użyjemy identifiera
-    -- phone   = 'phone_number'   -- brak kolumny? zakomentuj – telefon będzie pusty
+    -- phone   = 'phone_number'   -- brak kolumny? zakomentuj – numer weźmiemy z tabeli telefonu (niżej)
     -- job     = 'job',           -- domyślnie 'job'
     -- grade   = 'job_grade'      -- domyślnie 'job_grade'
 
@@ -39,7 +39,33 @@ Config.Db = {
 
     -- licencje: korzystamy z tabel ESX-a (esx_license), żeby widziały je też inne skrypty
     userLicenses = 'user_licenses',   -- nadane licencje: type, owner, time
-    licenses     = 'licenses'         -- definicje licencji: type (albo name) + label
+    licenses     = 'licenses',        -- definicje licencji: type (albo name) + label
+
+    -- ─────────────────────────────────────────────────────────────
+    --  TELEFONY – numer pracownika z tabeli skryptu telefonu (LB Phone: `phone_phones`)
+    --
+    --  Numer dopasowujemy po charidzie gracza – tym samym, który zapisujemy w
+    --  crp_jobcore_bossmenu_members.identifier. Gdy jedna postać ma kilka numerów,
+    --  bierzemy ten używany najpóźniej (`lastSeen`), a przy remisie większe `order`.
+    --  Numer z tej tabeli ma pierwszeństwo nad kolumną `phone` z tabeli graczy;
+    --  gdy nic nie znajdziemy, zostaje właśnie ona (albo pole puste).
+    --  Odświeża się razem z listą pracowników (Config.Cache.rosterSeconds wyżej).
+    --
+    --  Chcesz wyłączyć? Ustaw phones = false.
+    -- ─────────────────────────────────────────────────────────────
+    phones = {
+        table    = 'phone_phones',   -- tabela telefonu
+        number   = 'phone_number',   -- kolumna z numerem
+        lastSeen = 'last_seen',      -- kolumna „kiedy ostatnio używany” ('' = bez sortowania)
+
+        -- gdzie skrypt trzyma charid gracza (LB Phone zależy to od trybu telefonów-przedmiotów):
+        id       = 'id',             -- bez metadanych: id = identifier gracza (jedna komórka na postać)
+        owner    = 'owner_id',       -- z metadanymi: owner_id = identifier gracza, id = unikalny telefon
+        -- match = 'id'              -- wymuszamy jedną kolumnę ('id' albo 'owner'); domyślnie szukamy w obu
+
+        -- rozstrzygnięcie remisu w `lastSeen`: wygrywa większa wartość
+        -- order = 'id'
+    }
 }
 
 -- ─────────────────────────────────────────────────────────────
