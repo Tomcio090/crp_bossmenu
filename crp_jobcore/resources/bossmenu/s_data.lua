@@ -922,7 +922,13 @@ function data.LoadExtras(job)
 
     local tx = MySQL.query.await(('SELECT type, amount, by_name, label, reason, UNIX_TIMESTAMP(created_at) AS at \
         FROM %s WHERE job = ? ORDER BY id DESC LIMIT %d'):format(T('transactions'), LIM.logLimit), { job })
-    for _, r in ipairs(tx or {}) do c.tx[#c.tx + 1] = r end
+    -- w bazie kolumna nazywa się `by_name`, a panel (i pamięć, patrz data.Tx) używa `by`.
+    -- Bez tego przepisania historia transakcji po restarcie zasobu pokazywała „undefined”
+    -- zamiast nazwiska osoby, która wykonała operację.
+    for _, r in ipairs(tx or {}) do
+        r.by = r.by_name
+        c.tx[#c.tx + 1] = r
+    end
 
     local hist = MySQL.query.await(('SELECT entry, by_name, UNIX_TIMESTAMP(created_at) AS at \
         FROM %s WHERE job = ? ORDER BY id DESC LIMIT %d'):format(T('history'), LIM.logLimit), { job })
