@@ -22,6 +22,16 @@ shared_scripts {
     'resources/**/d_*.lua'
 }
 
+-- These are hard runtime requirements: the resource calls ESX/ox_target directly,
+-- while oxmysql and ox_lib are imported above.
+dependencies {
+    'es_extended',
+    'oxmysql',
+    'ox_lib',
+    'ox_target',
+    'esx_addonaccount'
+}
+
 files {
     'modules/**/*',
     'web/index.html',

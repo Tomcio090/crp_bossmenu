@@ -27,9 +27,26 @@ local function GetNewJob(jobname)
     return target, not isOff
 end
 
+-- Callbacki ox_lib są wywoływane przez klienta, dlatego target po stronie klienta
+-- nie wystarcza jako kontrola dostępu. Wymagamy fizycznej obecności przy punkcie.
+local function nearDutyLocation(src, jobName)
+    local ped = GetPlayerPed(src)
+    if not ped or ped == 0 then return false end
+
+    local pos = GetEntityCoords(ped)
+    for _, loc in pairs(data.locations or {}) do
+        if loc.jobs and loc.jobs[jobName] ~= nil then
+            local c = loc.coords
+            if c and #(pos - vec3(c.x, c.y, c.z)) <= 3.0 then return true end
+        end
+    end
+    return false
+end
+
 lib.callback.register('crp_jobcore:server:duty', function(source)
     local xPlayer = ESX.GetPlayerFromId(source)
     if not xPlayer then return false end
+    if not nearDutyLocation(source, xPlayer.job.name) then return false end
 
     local newJob, goingOnDuty = GetNewJob(xPlayer.job.name)
     if not newJob then return false end
@@ -59,9 +76,19 @@ exports('IsOnDuty', function(source)
     local src = tonumber(source)
     if not src then return false end
 
+    local xPlayer = ESX.GetPlayerFromId(src)
+    local jobName = xPlayer and xPlayer.job and xPlayer.job.name
+    if type(jobName) ~= 'string' then return false end
+
+    local isOff = jobName:sub(1, 3) == 'off'
+    local base = isOff and jobName:sub(4) or jobName
+    if not allowed(base) then return false end
+    -- ESX-owa praca jest źródłem prawdy dla stanu off; state bag nil nie może
+    -- zmienić `offcentra_autos` w osobę na służbie po ponownym połączeniu.
+    if isOff then return false end
+
     local ok, v = pcall(function() return Player(src).state.duty end)
     if not ok then return false end
-
     if v == 'break' then return 'break' end
     if v == false or v == 'off' then return false end
     return true

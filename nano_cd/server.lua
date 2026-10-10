@@ -17,6 +17,7 @@
 --  (praca `cd`/`centra_autos` ⇄ `off…`, state bag `duty` → export `crp_jobcore:IsOnDuty`).
 -- ██████████████████████████████████████████████████████████████████████████████
 
+local ESX = exports['es_extended']:getSharedObject()
 local CD = { jobs = {} }                -- jobs = [id zadania] = zadanie
 
 -- `source` przy TriggerEvent z INNEGO zasobu to nazwa zasobu (tekst), nie numer gracza –
@@ -42,6 +43,15 @@ end
 local function Dist(a, b)
     local dx, dy, dz = (a.x or 0) - (b.x or 0), (a.y or 0) - (b.y or 0), (a.z or 0) - (b.z or 0)
     return math.sqrt(dx * dx + dy * dy + dz * dz)
+end
+
+local function numericMap(value)
+    local out = {}
+    for key, item in pairs(type(value) == 'table' and value or {}) do
+        local index = tonumber(key)
+        if index and index > 0 and index == math.floor(index) then out[index] = item end
+    end
+    return out
 end
 
 local function PlayerName(src)
@@ -139,6 +149,15 @@ end
 
 -- 'duty' | 'off' | 'break' – jedno źródło prawdy: crp_jobcore
 local function dutyOf(src)
+    local xPlayer = ESX.GetPlayerFromId(src)
+    local jobName = xPlayer and xPlayer.job and xPlayer.job.name
+    local isOffWorker = type(jobName) == 'string'
+        and jobName:sub(1, 3) == 'off'
+        and (Config.Job == nil or Config.Job == '' or baseJob(jobName) == baseJob(Config.Job))
+    -- ESX-owy job jest autorytatywny dla statusu off; pusty state bag po reconnect
+    -- nie może zamienić `offcentra_autos` w pracownika na służbie.
+    if isOffWorker then return 'off' end
+
     local ok, res = pcall(function() return exports['crp_jobcore']:IsOnDuty(src) end)
     if ok and (type(res) == 'boolean' or res == 'break') then
         if res == 'break' then return 'break' end
@@ -147,10 +166,15 @@ local function dutyOf(src)
 
     local v
     ok, v = pcall(function() return Player(src).state.duty end)
-    if not ok then return 'duty' end
-    if v == 'break' then return 'break' end
-    if v == false or v == 'off' then return 'off' end
-    return 'duty'
+    if ok then
+        if v == 'break' then return 'break' end
+        if v == false or v == 'off' then return 'off' end
+        if v == true or v == 'duty' then return 'duty' end
+    end
+
+    -- Przy braku exportu/state bagu aktywna nazwa pracy oznacza służbę; off* nigdy.
+    if type(jobName) == 'string' and jobName:sub(1, 3) ~= 'off' then return 'duty' end
+    return 'off'
 end
 
 -- czy gracz pracuje w firmie CD (na służbie albo poza – sama przynależność)
@@ -232,7 +256,10 @@ local function Upsert(payload)
     if job and job.state == 'done' then return job end
     local fresh = job == nil
     if fresh then
-        job = { id = id, key = payload.orderId or ('ord-' .. id), loaded = {}, handed = {}, state = 'pending', receivedAt = os.time() }
+        job = {
+            id = id, key = payload.orderId or ('ord-' .. id), loaded = {},
+            handed = numericMap(payload.handed), state = 'pending', receivedAt = os.time()
+        }
         CD.jobs[id] = job
     end
 
@@ -255,15 +282,16 @@ local function Upsert(payload)
     return job
 end
 
-RegisterNetEvent('crp_cd:server:start', function(payload)
-    Upsert(payload)                      -- Upsert sam odrzuca śmieci (nil/tekst bez JSON-a)
-end)
-
-RegisterNetEvent('crp_cd:server:resend', function(payload)
+-- Te zdarzenia są kontraktem serwer-serwer (TriggerEvent), nie API dla klienta.
+AddEventHandler('crp_cd:server:start', function(payload)
     Upsert(payload)
 end)
 
-RegisterNetEvent('crp_cd:server:cancel', function(orderId, why)
+AddEventHandler('crp_cd:server:resend', function(payload)
+    Upsert(payload)
+end)
+
+AddEventHandler('crp_cd:server:cancel', function(orderId, why)
     local id = ParseId(type(orderId) == 'table' and (orderId.id or orderId.orderId) or orderId)
     local job = id and CD.jobs[id]
     if not job then return end
@@ -282,10 +310,15 @@ RegisterNetEvent('nano_cd:server:take', function(id)
     if not job then return TriggerClientEvent('nano_cd:notify', src, 'Nie ma takiego zadania.', 'error') end
     local can, why = CanWork(src)
     if not can then return TriggerClientEvent('nano_cd:notify', src, why, 'error') end
-    if job.claimedBy and job.claimedBy ~= src and dutyOf(job.claimedBy) == 'duty' then
-        return TriggerClientEvent('nano_cd:notify', src, ('To zadanie wiezie już %s.'):format(PlayerName(job.claimedBy)), 'error')
+    if job.claimedBy and job.claimedBy ~= src then
+        if isWorker(job.claimedBy) and dutyOf(job.claimedBy) == 'duty' then
+            return TriggerClientEvent('nano_cd:notify', src, ('To zadanie wiezie już %s.'):format(PlayerName(job.claimedBy)), 'error')
+        end
+        job.claimedBy = nil
+        job.loaded = {} -- stare uchwyty/pojazdy należały do poprzedniego kierowcy
     end
 
+    if job.claimedBy ~= src then job.loaded = {} end
     job.claimedBy = src
     if job.state == 'pending' or job.state == 'done' then job.state = 'loading' end
     SaveJob(job)
@@ -299,22 +332,41 @@ end)
 -- klient zgłasza: auto numer `index` stoi już na gnieździe `slot`
 RegisterNetEvent('nano_cd:server:loaded', function(id, index, plate)
     local src = srcOf(source); if not src then return end
-    
+
     local job = CD.jobs[tonumber(id)]
     if not job or job.claimedBy ~= src then return end
+    local can, why = CanWork(src)
+    if not can then return TriggerClientEvent('nano_cd:notify', src, why, 'error') end
 
     index = tonumber(index)
+    if not index or index ~= math.floor(index) then return end
     local item = Item(job, index)
     if not item or item.express then return end
     if job.handed and job.handed[index] then return end
     if job.loaded[index] then return end
 
-    job.loaded[index] = tostring(plate or item.plate or '')
+    local expectedPlate = tostring(item.plate or ''):gsub('%s+$', '')
+    local submittedPlate = tostring(plate or ''):gsub('%s+$', '')
+    if expectedPlate == '' or (submittedPlate ~= '' and submittedPlate ~= expectedPlate) then return end
+
+    local ped = GetPlayerPed(src)
+    if not ped or ped == 0 then return end
+    local dockDistance = Dist(GetEntityCoords(ped), Config.Docks.coords)
+    if dockDistance > (Config.Docks.radius or 70.0) + 15.0 then
+        return TriggerClientEvent('nano_cd:notify', src, 'Załadunek możesz zgłosić tylko w strefie doków.', 'error')
+    end
+
+    -- Tablicę bierzemy z serwerowego payloadu zamówienia, nigdy z klienta.
+    job.loaded[index] = expectedPlate
     local left = ToLoad(job)
-    if left == 0 then
+    local capacity = #(Config.Trailer.slots or {})
+    local trailerFull = capacity > 0 and LoadedCount(job) >= capacity
+    if left == 0 or trailerFull then
         job.state = 'hauling'
-        TriggerClientEvent('nano_cd:notify', src, ('Wszystko załadowane – jedź do: %s.'):format(
-            (JobDest(job) and JobDest(job).label) or 'punktu odbioru'), 'success')
+        local message = left == 0
+            and ('Wszystko załadowane – jedź do: %s.'):format((JobDest(job) and JobDest(job).label) or 'punktu odbioru')
+            or ('Laweta pełna – jedź oddać partię do: %s.'):format((JobDest(job) and JobDest(job).label) or 'punktu odbioru')
+        TriggerClientEvent('nano_cd:notify', src, message, 'success')
     else
         job.state = 'loading'
     end
@@ -323,58 +375,61 @@ RegisterNetEvent('nano_cd:server:loaded', function(id, index, plate)
     log('zadanie %s: załadowano #%d (%s), zostało %d', job.key, index, job.loaded[index], left)
 end)
 
--- klient zgłasza: auta zjechały z lawety na miejscu odbioru
+-- Klient zgłasza oddanie, ale serwer akceptuje wyłącznie pozycje, które sam
+-- oznaczył jako załadowane; indeksy i tablice z payloadu klienta nie są źródłem prawdy.
 RegisterNetEvent('nano_cd:server:handin', function(id, plates)
     local src = srcOf(source); if not src then return end
-    
+
     local job = CD.jobs[tonumber(id)]
     if not job then return end
-    if job.claimedBy and job.claimedBy ~= src then
-        return TriggerClientEvent('nano_cd:notify', src, 'To zadanie wiezie ktoś inny.', 'error')
+    local can, why = CanWork(src)
+    if not can then return TriggerClientEvent('nano_cd:notify', src, why, 'error') end
+    if job.claimedBy ~= src then
+        return TriggerClientEvent('nano_cd:notify', src, 'Najpierw przejmij to zadanie.', 'error')
     end
 
-    -- ── weryfikacja: oddawać wolno tylko w miejscu odbioru ──
     local dest = JobDest(job)
-    if dest then
-        local ped = GetPlayerPed and GetPlayerPed(src) or 0
-        if ped and ped ~= 0 then
-            local pos = GetEntityCoords(ped)
-            local d = Dist(pos, dest)
-            if d > (Config.Handover.maxServerDistance or 90.0) then
-                return TriggerClientEvent('nano_cd:notify', src,
-                    ('Pojazdy można oddać tylko na miejscu odbioru (%s) – jesteś %.0f m od celu.'):format(dest.label or 'punkt', d), 'error')
-            end
-            log('oddanie %s: gracz %.1f m od celu (limit %.1f)', job.key, d, Config.Handover.maxServerDistance or 90.0)
-        end
+    local ped = GetPlayerPed(src)
+    if not ped or ped == 0 then return end
+    local pos = GetEntityCoords(ped)
+    local distance = Dist(pos, dest)
+    local maxDistance = (Config.Handover and Config.Handover.maxServerDistance) or 35.0
+    if distance > maxDistance then
+        return TriggerClientEvent('nano_cd:notify', src,
+            ('Pojazdy można oddać tylko na miejscu odbioru (%s) – jesteś %.0f m od celu.'):format(dest.label or 'punkt', distance), 'error')
     end
+    log('oddanie %s: gracz %.1f m od celu (limit %.1f)', job.key, distance, maxDistance)
 
-    -- `plates` może przyjść jako tabela, JSON albo zwykły tekst – bierzemy tylko sensowne wpisy
     if type(plates) == 'string' then
         local ok, decoded = pcall(json.decode, plates)
         plates = (ok and type(decoded) == 'table') and decoded or nil
     end
 
-    local list = {}
+    local list, seen = {}, {}
     for _, entry in ipairs(type(plates) == 'table' and plates or {}) do
         if type(entry) ~= 'table' then entry = { index = entry } end
         local i = tonumber(entry.index or entry[1])
-        local item = Item(job, i)
-        if item and not item.express and not (job.handed and job.handed[i]) then
-            job.handed[i] = true
-            list[#list + 1] = { index = i, plate = tostring(entry.plate or entry[2] or (job.loaded and job.loaded[i]) or item.plate or '') }
+        if i and i == math.floor(i) and not seen[i] then
+            local item = Item(job, i)
+            local loadedPlate = job.loaded and job.loaded[i]
+            if item and not item.express and loadedPlate and not (job.handed and job.handed[i]) then
+                seen[i] = true
+                list[#list + 1] = { index = i, plate = tostring(loadedPlate) }
+            end
         end
     end
 
     if #list == 0 then
-        return TriggerClientEvent('nano_cd:notify', src, 'Nie ma czego oddawać.', 'error')
+        return TriggerClientEvent('nano_cd:notify', src, 'Nie ma załadowanych pojazdów do oddania.', 'error')
     end
 
-    for _, e in ipairs(list) do job.loaded[e.index] = nil end     -- laweta znów jest pusta
+    for _, entry in ipairs(list) do
+        job.handed[entry.index] = true
+        job.loaded[entry.index] = nil
+    end
 
-    local final = Remaining(job) == 0
+    local final = Remaining(job) == 0 -- `final` wylicza serwer, nie klient
     local byName = PlayerName(src)
-
-    -- → boss menu: płaci firmie dostawcy, wpisuje pojazdy do garażu i zamyka zamówienie
     TriggerEvent('crp_bossmenu:server:deliveryDone', job.key, list, final, byName)
 
     if final then
@@ -384,10 +439,10 @@ RegisterNetEvent('nano_cd:server:handin', function(id, plates)
         RemoveFor(job, 'done')
         log('zadanie %s: ODDANE i zamknięte (%s)', job.key, byName)
     else
-        job.state = 'loading'      -- zostały auta → wracasz na plac po kolejną partię
+        job.state = 'loading'
         SaveJob(job)
         Push(job)
-        TriggerClientEvent('nano_cd:notify', src, ('Partia oddana. Na lawecie zostało jeszcze %d %s – wracaj na plac.'):format(
+        TriggerClientEvent('nano_cd:notify', src, ('Partia oddana. Zostało jeszcze %d %s – wracaj na plac.'):format(
             Remaining(job), (Remaining(job) == 1 and 'pojazd' or 'pojazdy')), 'info')
         log('zadanie %s: oddano partię (%d), zostało %d', job.key, #list, Remaining(job))
     end
@@ -396,9 +451,14 @@ end)
 -- ── synchronizacja ────────────────────────────────────────────────────────────
 RegisterNetEvent('nano_cd:server:resync', function()
     local src = srcOf(source); if not src then return end
-    
+    local can = CanWork(src)
+    if not can then
+        TriggerClientEvent('nano_cd:cleared', src)
+        return
+    end
+
     PushAll(src)
-    -- poproś boss menu o ponowne wysłanie wszystkich fizycznych zadań (także po restarcie naszego zasobu)
+    -- Poproś boss menu o ponowne wysłanie zadań po autoryzacji pracownika.
     TriggerEvent('crp_bossmenu:server:deliveryResend')
 end)
 
@@ -407,6 +467,7 @@ AddEventHandler('playerDropped', function()
     for _, job in pairs(CD.jobs) do
         if job.claimedBy == src then
             job.claimedBy = nil
+            job.loaded = {}
             job.state = 'pending'
             SaveJob(job)
             Push(job)
@@ -422,11 +483,18 @@ AddEventHandler('onResourceStart', function(res)
         local rows = dbQuery('SELECT `id`, `data` FROM `crp_cd_jobs`')
         for _, row in ipairs(rows or {}) do
             local ok, job = pcall(json.decode, row.data)
-            if ok and type(job) == 'table' then
+            if ok and type(job) == 'table' and tonumber(job.id) then
+                job.id = tonumber(job.id)
                 job.claimedBy = nil
+                job.handed = numericMap(job.handed)
+                -- Klientowe entity handles nie przeżywają restartu zasobu. Ponownie
+                -- pobieramy wszystkie jeszcze nieoddane pojazdy zamiast zostawić wpisy
+                -- loaded, których handle nie istnieje już po stronie żadnego kierowcy.
+                job.loaded = {}
                 if job.state ~= 'done' then
-                    if job.state == 'hauling' or job.state == 'handover' then job.state = 'pending' end
+                    job.state = 'pending'
                     CD.jobs[job.id] = job
+                    SaveJob(job)
                 end
             end
         end
@@ -457,6 +525,7 @@ local function HandleJobChange(src)
     for _, job in pairs(CD.jobs) do
         if job.claimedBy == src then
             job.claimedBy = nil
+            job.loaded = {}
             job.state = 'pending'
             SaveJob(job)
             Push(job)

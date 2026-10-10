@@ -54,11 +54,13 @@ od peda z targetem (ox_target + lista ox_lib), zestaw pojawia się dopiero po pr
 
 | Kierunek | Event | Argumenty |
 |---|---|---|
-| bossmenu → nano_cd | `crp_cd:server:start` | `{ id/orderId, buyerJob, buyerLabel, supplierJob, total, destination = { x, y, z, heading, label } \| nil, items = { { index, model, name, category, express, plate }, … } }` |
+| bossmenu → nano_cd | `crp_cd:server:start` | `{ id/orderId, buyerJob, buyerLabel, supplierJob, total, destination = { x, y, z, heading, label } \| nil, handed = { [index] = plate }, items = { { index, model, name, category, express, plate }, … } }` |
 | bossmenu → nano_cd | `crp_cd:server:resend` | to samo co `start` (ponowne wysłanie po restarcie) |
 | bossmenu → nano_cd | `crp_cd:server:cancel` | `'ord-12'` / `12` / `{ id = … }`, powód |
 | nano_cd → bossmenu | `crp_bossmenu:server:deliveryDone` | `orderId, { { index = 1, plate = 'ABC 123' }, … }, final (bool), kto (nazwa) ` |
 | nano_cd → bossmenu | `crp_bossmenu:server:deliveryResend` | nic (odpowiedź przez callback, opcjonalnie) |
+
+Zdarzenia `crp_cd:server:start`, `resend` i `cancel` są wyłącznie serwer-serwer (`TriggerEvent`), nie wolno wywoływać ich z klienta.
 
 `express = true` (szybki transport) **nie jedzie lawetą** — takie auto jest już w garażu w chwili przyjęcia zamówienia.
 Na dokach lista pokazuje wyłącznie pozycje bez `express`, nie załadowane i nie oddane.
@@ -188,12 +190,12 @@ Stan trzyma **serwer** (`CD.jobs[id]`), klient dostaje tylko kopię (`Snapshot`)
 | na służbie (gdy `Config.RequireDuty = true`) | system duty z crp_jobcore |
 
 Służbę czytamy tak:
-1. `exports.crp_jobcore:IsOnDuty(source)` — dodane w `resources/duty/s_duty.lua`
-   (zwraca `true` / `false` / `'break'`),
-2. gdy tego exportu nie ma → state bag `duty` (ten sam, który czyta panel boss menu:
-   `true`/`'duty'` = na służbie, `false`/`'off'` = poza, `'break'` = przerwa),
-3. gdy nie ma ani jednego, ani drugiego → uznajemy, że gracz jest na służbie
-   (żeby `nano_cd` działał też na serwerze bez crp_jobcore), i patrzymy tylko na pracę.
+1. `exports.crp_jobcore:IsOnDuty(source)` — zwraca `true` / `false` / `'break'`;
+   nazwa pracy ESX `off<job>` jest zawsze traktowana jako poza służbą,
+2. gdy tego exportu nie ma → odczytujemy state bag `duty` i weryfikujemy pracę w ESX
+   (`true`/`'duty'` = na służbie, `false`/`'off'` = poza, `'break'` = przerwa),
+3. gdy brak exportu i state bagu → aktywna nazwa pracy ESX oznacza służbę; `off*`
+   nadal oznacza poza służbą. Zasób wymaga `es_extended` także w tym trybie.
 
 Wejście/zejście ze służby = zmiana pracy (`centra_autos` ⇄ `offcentra_autos`) przez punkt
 duty z targetem. `nano_cd` słucha `esx:setJob`:

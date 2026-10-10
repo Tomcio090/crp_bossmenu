@@ -104,7 +104,6 @@ Config.Society = function(job) return 'society_' .. job end
 -- ─────────────────────────────────────────────────────────────
 Config.Jobs = {
     police = {
-        minGrade = 0,
         salaryMax = 180,
         features  = { licenses = true, badges = true, records = true },   -- co pokazać w panelu
         supplier  = false,                                                -- true = firma może publikować ofertę dla innych firm
@@ -113,9 +112,14 @@ Config.Jobs = {
         }
     },
 
-    -- UWAGA: nazwa musi być identyczna z pracą w ESX. duty/wardrobe używają `ambulance` –
-    -- jeśli u Ciebie pogotowie to `ambulance`, zmień klucz `ems` na `ambulance`.
+    -- Obsługujemy obie popularne nazwy pracy EMS. Usuń alias, którego nie ma w Twoim ESX,
+    -- albo ustaw własny minGrade, jeśli próg zarządzania ma być inny niż najwyższy stopień.
     ems = {
+        salaryMax = 180,
+        features  = { licenses = true, badges = true, records = true },
+        licenses  = {}
+    },
+    ambulance = {
         salaryMax = 180,
         features  = { licenses = true, badges = true, records = true },
         licenses  = {}
@@ -133,7 +137,6 @@ Config.Jobs = {
     },
 
     centra_autos = {
-        minGrade = 0,
         salaryMax = 200,
         features  = { licenses = false, badges = false, records = true },
         supplier  = true,
@@ -296,6 +299,10 @@ Config.Goods = {
 -- Domyślnie czyta state bag `duty`: true/'duty' = na służbie, 'break' = przerwa, false/'off' = poza służbą,
 -- brak wartości = gracz online jest traktowany jako na służbie. Podłącz tu swój system służby.
 Config.GetDutyStatus = function(src, xPlayer)
+    local jobName = xPlayer and xPlayer.job and xPlayer.job.name
+    local offBase = type(jobName) == 'string' and jobName:match('^off(.+)$')
+    if Config.AllowOffDuty ~= false and offBase and Config.Jobs[offBase] then return 'off' end
+
     local v = Player(src).state.duty
     if v == 'break' then return 'break' end
     if v == false or v == 'off' then return 'off' end

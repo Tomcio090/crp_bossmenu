@@ -14,6 +14,10 @@ return {
         ['hospital'] = {
             coords = vec4(1129.5780, -1544.2419, 34.8, 107.1895),
             jobs = {['ambulance'] = 0, ['offambulance'] = 0}
+        },
+        ['centra_autos'] = {
+            coords = vec4(-924.9637, -1169.8820, 4.9501, 138.3062),
+            jobs = {['centra_autos'] = 0, ['offcentra_autos'] = 0}
         }
     }
 }

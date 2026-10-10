@@ -2,9 +2,10 @@
  nano_cd — nano skrypt dostawy pojazdów lawetą `tr2` (start prac nad skryptem CD/POD)
 ═══════════════════════════════════════════════════════════════════════════════
 
- To jest OSOBNY zasób. Nic nie trzeba zmieniać w `crp_jobcore` poza tym, że
- `Config.VehicleShop.delivery.resource` w `d_bossmenu.lua` musi się równać nazwie
- folderu tego zasobu (domyślnie: `nano_cd`).
+ To jest OSOBNY zasób. Nazwa w `Config.VehicleShop.delivery.resource` w
+ `crp_jobcore/resources/bossmenu/d_bossmenu.lua` musi się równać nazwie folderu
+ tego zasobu (domyślnie: `nano_cd`). Dla firmy dostawczej dodaj też punkt służby
+ w `crp_jobcore/resources/duty/d_duty.lua` — domyślnie `centra_autos` jest już wpisane.
 
 ───────────────────────────────────────────────────────────────────────────────
  1. INSTALACJA
@@ -12,13 +13,16 @@
  · Wrzuć folder `nano_cd` do `resources/` (np. `resources/[crp]/nano_cd`).
    UWAGA: jeśli zmienisz nazwę folderu, popraw `Config.VehicleShop.delivery.resource`
    w `moje pliki/crp_jobcore/resources/bossmenu/d_bossmenu.lua`.
- · W `server.cfg` dopisz:
+ · W `server.cfg` uruchom wymagane zasoby:
+       ensure es_extended
        ensure oxmysql
-       ensure ox_target      (żeby ped na dokach miał target – bez tego działa [E])
-       ensure ox_lib         (ładniejsza lista aut – bez tego lista idzie na czat)
-       ensure crp_jobcore    (boss menu – kolejność dowolna)
+       ensure ox_lib
+       ensure ox_target      (wymagany przez crp_jobcore; nano_cd ma fallback [E])
+       ensure esx_addonaccount
+       ensure crp_jobcore
        ensure nano_cd
- · Tabela `crp_cd_jobs` tworzy się sama przy pierwszym starcie (zadania przeżywają restart).
+ · Zależności z manifestu pilnują kolejności startu. Tabela `crp_cd_jobs` tworzy się
+   sama; stan dostaw jest zapisywany i odtwarzany po restarcie.
 
 ───────────────────────────────────────────────────────────────────────────────
  2. JAK TO DZIAŁA (przepływ)
@@ -132,13 +136,14 @@
       crp_bossmenu:server:deliveryDone    orderId, { {index=, plate=}, ... }, final, who
       crp_bossmenu:server:deliveryResend  (prośba: „wyślij ponownie aktywne zadania”)
  · exporty tego zasobu:
-      exports.nano_cd:SetDuty(source, true/false)   – oznacz pracownika jako „na służbie”
       exports.nano_cd:Jobs()                        – lista zadań
       exports.nano_cd:Job(id)                       – jedno zadanie
-      exports.nano_cd:Handin(id, plates, byName)     – ręczne domknięcie
+      exports.nano_cd:Handin(id, plates, byName)     – ręczne domknięcie przez zaufany zasób serwerowy
+   Służbę obsługuje `crp_jobcore`; `nano_cd` nie udostępnia osobnego `SetDuty`.
  · payload zadania:
       { orderId = 'ord-12', id = 12, buyerJob, buyerLabel, supplierJob, total,
         destination = { x, y, z, heading, label } | nil,      -- punkt pracy kupującego
+        handed = { [index] = plate, ... },                    -- opcjonalnie: pozycje oddane wcześniej
         items = { { index, model, name, category, express, plate }, ... } }
       (dla pozycji `express = true` pole `plate` jest puste – takich aut nie wieziemy)
 
@@ -151,13 +156,11 @@
  `crp_jobcore/resources/duty/d_duty.lua`).
 
  Skąd `nano_cd` wie, że jesteś na służbie:
-   · w pierwszej kolejności pyta export:   exports.crp_jobcore:IsOnDuty(source)
-     (dodany w `resources/duty/s_duty.lua`: true / false / 'break'),
-   · jeśli exportu nie ma (np. starsza wersja crp_jobcore) – czyta ten sam state bag
-     `duty`, który czyta panel boss menu (true/'duty' = na służbie, false/'off' = poza,
-     'break' = przerwa). Przerwa jest traktowana jak brak służby.
-   · gdy nie ma ani exportu, ani state bagu (np. `nano_cd` na serwerze bez crp_jobcore)
-     – uznaje, że gracz jest na służbie i patrzy tylko na pracę z `Config.Job`.
+   · w pierwszej kolejności pyta export `exports.crp_jobcore:IsOnDuty(source)`
+     (true / false / 'break'); stan pracy ESX `off<job>` zawsze oznacza brak służby,
+   · jeśli exportu nie ma (np. starsza wersja crp_jobcore), odczytuje state bag `duty`
+     i weryfikuje pracę bezpośrednio w ESX. Brak state bagu nie zmienia pracy `off*`
+     w pracę na służbie. Przerwa jest traktowana jak brak służby.
 
  W configu są do tego dwie rzeczy:
    · `Config.Job` – praca firmy wożącej pojazdy (bez `off`), domyślnie `centra_autos`
