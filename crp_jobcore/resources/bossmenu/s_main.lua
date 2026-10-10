@@ -1071,7 +1071,7 @@ H.orderGoods = function(c, d)
     local catalog = {}
     for _, p in ipairs(data.Products(supplierJob)) do catalog[p.id] = p end
 
-    local items, total, express = {}, 0, 0
+    local items, names, total, express = {}, {}, 0, 0
     for _, picked in ipairs(d.items) do
         local product = type(picked) == 'table' and catalog[tonumber(picked.id)]
         local qty = type(picked) == 'table' and int(picked.qty, 1, vs.maxQty)
@@ -1089,6 +1089,8 @@ H.orderGoods = function(c, d)
         local fast = picked.express == true and fee > 0
         items[#items + 1] = { id = product.id, name = product.name, price = product.price, qty = qty,
                               express = fast, fee = fast and fee or 0 }
+        -- do historii idzie lista tekstowa (jak przy zamówieniu pojazdów) – panel skleja ją w jeden wiersz
+        names[#names + 1] = ('%s ×%d%s'):format(product.name, qty, fast and ' ⚡' or '')
         total = total + product.price * qty + (fast and fee * qty or 0)
         if fast then express = express + 1 end
     end
@@ -1105,7 +1107,7 @@ H.orderGoods = function(c, d)
     data.Tx(c.job, 'out', total, c.name, 'Zamówienie towarów', ('%s: %s'):format(data.JobLabel(supplierJob), summary(items)))
     data.Hist(c.job, c.name, { type = 'goodsOrder', orderId = 'zam-' .. id, supplier = data.JobLabel(supplierJob), lines = #items,
         units = (function() local n = 0 for _, it in ipairs(items) do n = n + it.qty end return n end)(),
-        express = express, total = total, items = items })
+        express = express, total = total, items = names })
 
     Server.NotifyJob(supplierJob, ('Nowe zamówienie towarów od %s (zam-%d)%s'):format(data.JobLabel(c.job), id,
         express > 0 and (' – szybki transport: %d %s'):format(express, plural(express, 'pozycja', 'pozycje', 'pozycji')) or ''), 'info')

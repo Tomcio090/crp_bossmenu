@@ -125,7 +125,8 @@ const icon = (name, cls = 'size-5') =>
 /* ---------- Helpery ---------- */
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => [...r.querySelectorAll(s)];
-const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+/* brakująca wartość nie może wypisać się w panelu jako „undefined”/„null” (stąd `?? ''`) */
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const money = n => (n < 0 ? '-$' : '$') + Math.abs(Number(n)).toLocaleString('en-US').replace(/,/g, ' ');
 // Duże kwoty nie mogą się ucinać: dobieramy wielkość czcionki do długości tekstu (np. saldo 100 000 000).
 const moneyFs = (v, base = 26, mid = 20, small = 15) => { const L = String(v).length; return L > 15 ? small - 2 : L > 12 ? small : L > 9 ? mid : base; };
@@ -1061,8 +1062,8 @@ function viewProfile(e) {
         return entryRow({
             ic: v ? 'ban' : REC[r.kind].icon, tone: REC[r.kind].tone, dim: !!v,
             title: `<span class="${v ? 'line-through' : ''}">${REC[r.kind].label}</span>${v ? '<span class="px-1.5 py-px rounded bg-slate-800 text-slate-400 text-[9px] font-bold uppercase tracking-wide">Unieważniony</span>' : ''}`,
-            body: reasonLine(r.reason, !!v), meta: `${esc(r.by)} · ${esc(v ? fmtAt(r.at) : shortAt(r.at))}`, metaTitle: `${esc(r.by)} · ${esc(fmtAt(r.at))}`, inline: !v,
-            note: v ? `<p class="flex items-center gap-1 text-[10px] leading-4 text-slate-400 mt-0.5 truncate">${icon('ban', 'size-3 shrink-0')}<span class="truncate">Unieważnił: <span class="font-semibold text-slate-300">${esc(v.by)}</span> · ${esc(v.at)}</span></p>${v.reason ? `<p class="text-[10px] leading-4 text-slate-400 line-clamp-2 break-words" title="${esc(v.reason)}">Powód: ${esc(v.reason)}</p>` : ''}` : '',
+            body: reasonLine(r.reason, !!v), meta: `${esc(r.by || '—')} · ${esc(v ? fmtAt(r.at) : shortAt(r.at))}`, metaTitle: `${esc(r.by || '—')} · ${esc(fmtAt(r.at))}`, inline: !v,
+            note: v ? `<p class="flex items-center gap-1 text-[10px] leading-4 text-slate-400 mt-0.5 truncate">${icon('ban', 'size-3 shrink-0')}<span class="truncate">Unieważnił: <span class="font-semibold text-slate-300">${esc(v.by || '—')}</span> · ${esc(v.at)}</span></p>${v.reason ? `<p class="text-[10px] leading-4 text-slate-400 line-clamp-2 break-words" title="${esc(v.reason)}">Powód: ${esc(v.reason)}</p>` : ''}` : '',
             act: v ? '' : `<button data-act="voidRecord" data-ssn="${e.ssn}" data-id="${esc(r.id)}" title="Unieważnij wpis"
                 class="block p-0.5 rounded-md text-slate-500 hover:text-white hover:bg-brand transition">${icon('ban', 'size-4')}</button>`
         });
@@ -1072,7 +1073,7 @@ function viewProfile(e) {
         return entryRow({
             ic: up ? 'chevron-up' : 'chevron-down', tone: up ? 'emerald' : 'amber',
             title: `<span class="truncate">${esc(gradeName(h.from))}</span><span class="text-slate-500 shrink-0">${icon('arrows-right', 'size-3.5')}</span><span class="truncate ${up ? 'text-emerald-400' : 'text-amber-400'}">${esc(gradeName(h.to))}</span>`,
-            body: reasonLine(h.reason), meta: `${up ? 'Awans' : 'Degradacja'} · ${esc(h.by)} · ${esc(fmtAt(h.at))}`
+            body: reasonLine(h.reason), meta: `${up ? 'Awans' : 'Degradacja'} · ${esc(h.by || '—')} · ${esc(fmtAt(h.at))}`
         });
     };
     const column = (key, title, ic, list, rowFn, add = '') => listPanel({ key, title, ic, count: list.length, rows: list.map(rowFn), add });
@@ -1356,14 +1357,14 @@ function appFaction() {
         </div>
     </section>`;
     const txRow = t => {
-        const inn = t.type === 'in';
+        const inn = t.type === 'in', by = t.by || '—';       // starsze wpisy mogą nie mieć nazwiska
         return `
         <li class="flex items-center gap-2.5 px-2.5 py-1.5 rounded-xl border bg-slate-950/40 border-slate-800 min-w-0">
             <div class="size-7 shrink-0 rounded-lg border flex items-center justify-center ${inn ? TONES.emerald : TONES.brand}">${icon(inn ? 'arrow-down' : 'arrow-up', 'size-4')}</div>
             <div class="flex-1 min-w-0">
                 <p class="text-xs font-bold text-white truncate leading-4">${esc(t.label)}</p>
                 ${t.reason ? `<p class="text-[11px] text-slate-300 line-clamp-2 break-words leading-4" title="${esc(t.reason)}">${esc(t.reason)}</p>` : ''}
-                <p class="text-[10px] text-slate-500 truncate leading-4" title="${esc(t.by)} · ${esc(fmtAt(t.at))}">${esc(t.by)} · ${esc(fmtAt(t.at))}</p>
+                <p class="text-[10px] text-slate-500 truncate leading-4" title="${esc(by)} · ${esc(fmtAt(t.at))}">${esc(by)} · ${esc(fmtAt(t.at))}</p>
             </div>
             <p class="text-xs font-extrabold whitespace-nowrap ${inn ? 'text-emerald-400' : 'text-brand'}">${inn ? '+' : '−'}${money(t.amount)}</p>
         </li>`;
@@ -1495,28 +1496,39 @@ const HIST_TYPES = {
     goodsOrder: { label: 'Zamówienie towarów', ic: 'box', tone: 'sky', group: 'orders', filter: 'Zamówienia' },
     goodsCancel: { label: 'Anulowanie zamówienia', ic: 'x', tone: 'amber', group: 'orders', filter: 'Zamówienia' },
     orderHandled: { label: 'Zamówienie przychodzące', ic: 'inbox', tone: 'emerald', group: 'orders', filter: 'Zamówienia' },
+    delivery: { label: 'Dostawa pojazdów', ic: 'truck-delivery', tone: 'sky', group: 'orders', filter: 'Zamówienia' },
+    license: { label: 'Licencje', ic: 'certificate', tone: 'violet', group: 'license', filter: 'Licencje' },
     offerChange: { label: 'Zmiana oferty', ic: 'building-store', tone: 'sky', group: 'offer', filter: 'Oferta' }
 };
+/* wpis w nieznanym typie (starsza/nowsza wersja zasobu) – nie udajemy zwolnienia */
+const HIST_FALLBACK = { label: 'Historia', ic: 'history', tone: 'slate', group: 'other' };
 const plVeh = n => n === 1 ? 'pojazd' : (n % 10 >= 2 && n % 10 <= 4 && (n % 100 < 10 || n % 100 >= 20)) ? 'pojazdy' : 'pojazdów';
 const HIST_HOOK = { set: 'ustawiono nowy link', changed: 'zmieniono link', removed: 'usunięto link (kanał wyłączony)' };
+/* pozycje wpisu: nowe wpisy trzymają listę tekstów, starsze zamówienia towarowe – obiekty pozycji */
+const histItems = it => (Array.isArray(it) ? it : [])
+    .map(x => typeof x === 'string' ? x : `${x?.name || x?.model || '—'}${x?.qty ? ` ×${x.qty}` : ''}${x?.express ? ' ⚡' : ''}`)
+    .join(', ');
 const histRow = h => {
-    const t = HIST_TYPES[h.type] || HIST_TYPES.fire;
+    const t = HIST_TYPES[h.type] || HIST_FALLBACK;
     const hk = HOOKS.find(x => x.key === h.key);
     const strong = v => `<span class="font-bold text-white">${esc(v)}</span>`;
     const body = h.type === 'fire'
         ? `${strong(h.name)} <span class="text-slate-500">· ${esc(h.ssn || '—')}${h.gradeName ? ` · ${esc(h.gradeName)}` : ''}${h.vehicles ? ` · odebrano pojazdów: ${h.vehicles}` : ''}</span>`
         : h.type === 'order'
             ? `${strong(`${h.count} ${plVeh(h.count)}`)} <span class="text-slate-500">· ${money(h.total)}${h.express ? ` · szybki transport: ${h.express}` : ''}</span>
-               <span class="block truncate text-[11px] text-slate-500" title="${esc((h.items || []).join(', '))}">${esc((h.items || []).join(', '))}</span>`
+               <span class="block truncate text-[11px] text-slate-500" title="${esc(histItems(h.items))}">${esc(histItems(h.items))}</span>`
         : h.type === 'orderCancel'
             ? `Zamówienie ${strong(String(h.orderId || '').replace(/^ord-/, '#'))} <span class="text-slate-500">· ${h.count} ${plVeh(h.count)} · zwrot ${money(h.total)}</span>`
         : h.type === 'vehAssign'
             ? `${strong(h.vehicle)} <span class="text-slate-500">· ${esc(h.plate)}</span><span class="text-slate-500"> → </span>${strong(h.name)}${h.from ? `<span class="block text-[11px] text-slate-500">poprzednio: ${esc(h.from)}</span>` : ''}`
         : h.type === 'vehRevoke'
             ? `${strong(h.vehicle)} <span class="text-slate-500">· ${esc(h.plate)} · odebrano:</span> ${strong(h.name)}`
+        : h.type === 'delivery'
+            ? `Zamówienie ${strong(String(h.orderId || '').replace(/^[a-z]+-/i, '#'))} <span class="text-slate-500">· ${esc(h.buyer || '')} · ${h.count} ${plVeh(h.count)}${h.final ? ' · dostawa zakończona' : ' · dostawa częściowa'}</span>
+               <span class="block truncate text-[11px] text-slate-500" title="${esc(histItems(h.items))}">${esc(histItems(h.items))}</span>`
         : h.type === 'goodsOrder'
             ? `${strong(h.supplier)} <span class="text-slate-500">· ${h.units} szt. · ${money(h.total)}</span>
-               <span class="block truncate text-[11px] text-slate-500" title="${esc((h.items || []).join(', '))}">${esc((h.items || []).join(', '))}</span>`
+               <span class="block truncate text-[11px] text-slate-500" title="${esc(histItems(h.items))}">${esc(histItems(h.items))}</span>`
         : h.type === 'goodsCancel'
             ? `Zamówienie ${strong(String(h.orderId || '').replace(/^[a-z]+-/i, '#'))} <span class="text-slate-500">· ${esc(h.supplier || '')} · zwrot ${money(h.total)}</span>`
         : h.type === 'orderHandled'
@@ -1529,7 +1541,9 @@ const histRow = h => {
             ? `Wszyscy pracownicy <span class="text-slate-500">· ${h.count} ${h.count === 1 ? 'osoba' : 'osób'} · wyzerowano łącznie ${esc(fmtHours(h.total))}</span>`
         : h.type === 'salary'
             ? `Stopień ${strong(h.gradeName)}<span class="text-slate-500"> · </span><span class="text-slate-400">${money(h.from)}</span> <span class="inline-block align-[-3px] text-slate-500">${icon('arrow-right', 'size-3.5')}</span> ${strong(money(h.to))}<span class="text-slate-500"> / h</span>`
-            : `${strong(hk ? hk.label : h.key)}<span class="text-slate-500"> · ${esc(HIST_HOOK[h.action] || '')}</span>`;
+        : h.type === 'license'
+            ? `${h.action === 'remove' ? 'Odebrano licencję' : 'Nadano licencję'} ${strong(h.label || h.license || '—')} <span class="text-slate-500">· ${esc(h.name || '—')}${h.ssn ? ` · ${esc(h.ssn)}` : ''}</span>`
+            : `${strong(hk ? hk.label : (h.key || t.label))}<span class="text-slate-500"> · ${esc(HIST_HOOK[h.action] || '')}</span>`;
     return entryRow({
         ic: t.ic, tone: t.tone, title: `<span class="truncate">${t.label}</span>`,
         act: `<span class="text-[10px] font-medium text-slate-500 whitespace-nowrap">${esc(shortAt(h.at))}</span>`,
@@ -1539,7 +1553,7 @@ const histRow = h => {
 };
 function appHistory() {
     const f = EMP.histFilter || 'all', all = S.history || [];
-    const grp = h => (HIST_TYPES[h.type] || HIST_TYPES.fire).group;
+    const grp = h => (HIST_TYPES[h.type] || HIST_FALLBACK).group;
     const list = f === 'all' ? all : all.filter(h => grp(h) === f);
     const chip = (v, l, n) => `<button data-act="histFilter" data-v="${v}" class="px-2.5 py-1 rounded-lg text-[11px] font-bold transition ${f === v ? 'bg-brand text-white' : 'bg-slate-800 text-slate-300 hover:bg-slate-700'}">${l}<span class="ml-1 opacity-60">${n}</span></button>`;
     const groups = []; Object.values(HIST_TYPES).forEach(t => { if (!groups.some(g => g.group === t.group)) groups.push(t); });
@@ -1740,7 +1754,7 @@ function garageOrders() {
                     ${stChip(st.tone, st.label, null)}${nExp ? stChip('amber', `Szybki transport ×${nExp}`, 'bolt') : ''}
                 </div>
                 <p class="text-[10px] text-slate-500 truncate" title="${esc(names)}">${esc(names)}</p>
-                <p class="text-[10px] text-slate-600 truncate" title="${esc(o.note || '')}">${esc(o.by)} · ${esc(fmtAt(o.at))}${o.note ? ` · ${esc(o.note)}` : ''}</p>
+                <p class="text-[10px] text-slate-600 truncate" title="${esc(o.note || '')}">${esc(o.by || '—')} · ${esc(fmtAt(o.at))}${o.note ? ` · ${esc(o.note)}` : ''}</p>
             </div>
             ${dev}
             <span class="shrink-0 text-xs font-extrabold ${dim ? 'text-slate-500 line-through' : 'text-white'}">${money(ordTotal(o))}</span>
@@ -2164,7 +2178,7 @@ function shopRow({ o, kind }, side) {
                 ${kind === 'vehicles' ? stChip('sky', 'Pojazdy', 'car') : stChip('emerald', 'Towary', 'box')}${stChip(st.tone, st.label, null)}${o.delivery === 'physical' && !dim ? stChip('violet', 'Laweta CD', 'truck-delivery') : ''}${nExp ? stChip('amber', `Szybki transport ×${nExp}`, 'bolt') : ''}
             </div>
             <p class="text-[10px] text-slate-500 truncate" title="${esc(shopSum(ls))}">${party} · ${esc(shopSum(ls))}</p>
-            <p class="text-[10px] text-slate-600 truncate">${esc(o.by)} · ${esc(fmtAt(o.at))}${tail ? ` · ${tail}` : ''}</p>
+            <p class="text-[10px] text-slate-600 truncate">${esc(o.by || '—')} · ${esc(fmtAt(o.at))}${tail ? ` · ${tail}` : ''}</p>
         </div>
         ${dev}
         <div class="shrink-0 w-[92px] text-right"><p class="text-xs font-extrabold ${dim ? 'text-slate-500 line-through' : 'text-white'}">${money(shopTotal(o, kind))}</p>
@@ -3229,7 +3243,7 @@ function act(type, el) {
                 icon: 'ban', tone: 'brand', title: 'Unieważnić wpis?', text: `${REC[rec.kind].label} · ${fullName(emp)}`, ok: 'Unieważnij', needReason: true,
                 body: () => `<div class="space-y-3"><div class="p-3 rounded-xl bg-slate-950/40 border border-slate-800">
                     <p class="text-sm text-slate-200 break-words">${esc(rec.reason)}</p>
-                    <p class="text-[11px] text-slate-500 mt-1.5">Wystawił: <span class="text-slate-300 font-semibold">${esc(rec.by)}</span> · ${esc(fmtAt(rec.at))}</p></div>
+                    <p class="text-[11px] text-slate-500 mt-1.5">Wystawił: <span class="text-slate-300 font-semibold">${esc(rec.by || '—')}</span> · ${esc(fmtAt(rec.at))}</p></div>
                     ${reasonField('Powód unieważnienia')}
                     <p class="text-[11px] text-slate-500 -mt-1">Wpis zostanie w historii (wyszarzony, z Twoim nazwiskiem i powodem), ale przestanie być wliczany do statystyk. Tej operacji nie można cofnąć.</p></div>`,
                 onOk: () => {

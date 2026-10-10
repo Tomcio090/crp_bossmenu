@@ -18,7 +18,6 @@ Config.Base = {
     truckCoords = vector4(-910.7054, -1169.7985, 4.9047, 210.5949),
 
     removeWhenIdle = true,
-.
     removeDistance = 25.0,
 }
 
