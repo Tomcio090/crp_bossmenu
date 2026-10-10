@@ -934,13 +934,12 @@ H.supplierOrder = function(c, d)
         and Server.DeliveryEnabled() and not (Config.VehicleShop.delivery or {}).manualOverride then
         return err('Pojazdy są w drodze lawetą – oddanie potwierdza firma dostawcy na miejscu odbioru')
     end
-    if action == 'deliver' and kind == 'vehicles' then Server.CancelDelivery(id, order, 'manual') end
-
     local from = action == 'deliver' and 'accepted' or 'pending'
     local to   = ({ accept = 'accepted', reject = 'rejected', deliver = 'delivered' })[action]
     if not data.SetOrderStatus(id, 'supplier_job', c.job, from, to, reason, order.buyer_job, c.job) then
         return err('Status zamówienia już się zmienił')
     end
+    if action == 'deliver' and kind == 'vehicles' then Server.CancelDelivery(id, order, 'manual') end
 
     local items = json.decode(order.items) or {}
     local buyerLabel = data.JobLabel(order.buyer_job)
@@ -1184,9 +1183,10 @@ local function dispatchDelivery(order, items)
 
     local task, resend = Physical[id], Physical[id] ~= nil
     if not task then
-        task = { plates = {}, by = order.by_name, at = os.time() }
+        task = { plates = {}, handed = {}, by = order.by_name, at = os.time() }
         Physical[id] = task
     end
+    task.handed = task.handed or {}
 
     local payload = {
         orderId    = 'ord-' .. id,
@@ -1196,6 +1196,7 @@ local function dispatchDelivery(order, items)
         supplierJob = order.supplier_job,
         total      = order.total,
         destination = deliveryDestination(order.buyer_job),
+        handed     = task.handed,
         items      = {}
     }
 
@@ -1271,120 +1272,166 @@ function Server.ResendDeliveries(supplierJob, to)
     return count
 end
 
--- ── zgłoszenie oddania pojazdów (z zasobu dostawy) ──
---  plates = { { index = 1, plate = 'ABC 123' }, ... } – auta oddane w tym kursie
---  final  = true, gdy to była ostatnia partia zamówienia (wtedy płacimy i zamykamy zamówienie)
-RegisterNetEvent('crp_bossmenu:server:deliveryDone', function(orderId, plates, final, byName)
-    local src = playerSrc(source)
+-- ── zgłoszenie oddania pojazdów (serwer-serwer, nie event klienta) ──
+-- Nano CD i inne zaufane zasoby wołają to przez TriggerEvent.
+local deliveryDoneLocks = {}
+
+local function handleDeliveryDone(orderId, plates, final, byName)
     local id = tonumber(tostring(orderId or ''):match('(%d+)$') or '')
     if not id then return end
 
     local order = data.GetOrderRaw(id, 'vehicles')
-    if not order then return end
-    if order.delivery ~= 'physical' then return end
+    if not order or order.status ~= 'accepted' or order.delivery ~= 'physical' then return end
 
-    -- kto zgłasza? gracz-lider firmy dostawcy (albo zgłoszenie z innego zasobu – wtedy `source` nie jest graczem)
     local by = whoName(byName, 'System')
-    if src then
-        local x = ESX.GetPlayerFromId(src)
-        if not x or baseJob(x.job and x.job.name) ~= order.supplier_job or not Server.CanManage(x) then
-            return print(('^1[crp_bossmenu] dostawa %d: zgłoszenie od gracza bez uprawnień (src %s)^7'):format(id, src))
-        end
-        by = x.name or ('gracz #%d'):format(src)
-    end
-
     local items = type(order.items) == 'string' and (json.decode(order.items) or {}) or (order.items or {})
-    local task  = Physical[id]
-    if task then task.handed = task.handed or {} end
-    local handed = (task and task.handed) or {}
+    local task = Physical[id]
+    if not task then
+        task = { plates = {}, handed = {}, by = order.by_name, at = os.time() }
+        Physical[id] = task
+    end
+    task.handed = task.handed or {}
+    local handed = task.handed
 
-    -- ── co przyszło w `plates`? Obsługujemy każdą rozsądną postać, bo wołają nas różne zasoby:
-    --    { { index = 1, plate = 'ABC 123' }, ... }   (nasz nano_cd)
-    --    { 'ABC 123', 'DEF 456' }                    (lista tablic – kolejność = kolejność aut)
-    --    '["ABC 123"]' / '{"1":"ABC 123"}' / 'ABC 123' (tekst, także JSON)
-    --    nil                                         („oddane” – użyj tablic wygenerowanych przy zadaniu)
     local provided = plates
     if type(provided) == 'string' then
         local txt = provided:gsub('^%s+', ''):gsub('%s+$', '')
         local decoded
         if txt:sub(1, 1) == '[' or txt:sub(1, 1) == '{' then
-            local ok, d = pcall(json.decode, txt)
-            if ok and type(d) == 'table' then decoded = d end
+            local ok, value = pcall(json.decode, txt)
+            if ok and type(value) == 'table' then decoded = value end
         end
         if decoded then provided = decoded
         elseif txt ~= '' then provided = { txt } end
     end
 
-    -- pozycje, które jeszcze nie zostały oddane (szybki transport pomijamy – te auta są już w garażu)
     local queue = {}
-    for i, it in ipairs(items) do
-        if not it.express and not handed[i] then queue[#queue + 1] = i end
+    for i, item in ipairs(items) do
+        if not item.express and not handed[i] then queue[#queue + 1] = i end
     end
-
-    -- brak tablic w zgłoszeniu → bierzemy te, które wygenerowaliśmy przy wysyłaniu zadania
     if type(provided) ~= 'table' or #provided == 0 then
         provided = {}
-        for k, i in ipairs(queue) do provided[k] = { index = i, plate = task and task.plates and task.plates[i] or nil } end
+        for k, i in ipairs(queue) do
+            provided[k] = { index = i, plate = task.plates[i] }
+        end
     end
 
-    local names, granted = {}, 0
-    local pos = 0
+    local pending, seen, pendingSet, pos = {}, {}, {}, 0
     for _, entry in ipairs(provided) do
-        local i, plate
+        local index, requestedPlate
         if type(entry) == 'table' then
-            i = tonumber(entry.index or entry[1])
-            plate = tostring(entry.plate or entry[2] or '')
+            index = tonumber(entry.index or entry[1])
+            requestedPlate = tostring(entry.plate or entry[2] or '')
         else
             pos = pos + 1
-            i = queue[pos] or queue[1]
-            plate = tostring(entry or '')
+            index = queue[pos]
+            requestedPlate = tostring(entry or '')
         end
 
-        local it = i and items[i]
-        if it and not it.express and not handed[i] then
-            if plate == '' or not plate:match('^[%w ]+$') or #plate > 12 then
-                plate = (task and task.plates and task.plates[i]) or data.NewPlate()
-            end
-
-            if plate then
-                handed[i] = plate
-                data.AddVehicle(order.buyer_job, plate, it.model, it.name, it.category)
-                data.GrantVehicle(order.buyer_job, plate, it.model)
-                granted = granted + 1
-                names[#names + 1] = ('%s (%s)'):format(it.name or it.model, plate)
+        if index and index == math.floor(index) and not seen[index] then
+            local item = items[index]
+            if item and not item.express and not handed[index] then
+                local expected = tostring(task.plates[index] or '')
+                local plate = expected ~= '' and expected or requestedPlate
+                if plate == '' or not plate:match('^[%w ]+$') or #plate > 12 then
+                    plate = data.NewPlate()
+                end
+                if plate then
+                    seen[index] = true
+                    pendingSet[index] = true
+                    pending[#pending + 1] = { index = index, item = item, plate = plate }
+                end
             end
         end
     end
 
-    if granted == 0 then
-        return print(('^3[crp_bossmenu]^7 dostawa %d: nie rozpoznano żadnej tablicy – nic nie zapisano'):format(id))
+    if #pending == 0 then
+        print(('^3[crp_bossmenu]^7 dostawa %d: brak nowych, poprawnych pozycji do zapisania'):format(id))
+        return
     end
 
-    -- ile aut z tego zamówienia jeszcze zostało na lawecie? (decyduje, czy zamykamy zamówienie)
+    -- `final` pochodzi z zaufanego serwerowego zasobu dostawy; gdy nie zostanie
+    -- podany, domykamy automatycznie tylko wtedy, gdy wszystkie pozycje są znane.
     local left = 0
-    for i, it in ipairs(items) do
-        if not it.express and not handed[i] then left = left + 1 end
+    for i, item in ipairs(items) do
+        if not item.express and not handed[i] and not pendingSet[i] then left = left + 1 end
+    end
+    local isFinal = final == nil and left == 0 or flag(final)
+    local orderNo, buyerLabel = 'ord-' .. id, data.JobLabel(order.buyer_job)
+    if isFinal and not data.HasSociety(order.supplier_job) then
+        print(('^1[crp_bossmenu]^7 dostawa %d: brak konta firmy dostawcy; nie zapisano finalizacji'):format(id))
+        Server.NotifyJob(order.supplier_job, ('Zamówienie %s czeka – konto firmy dostawcy jest niedostępne.'):format(orderNo), 'error')
+        SetTimeout(1000, function() Server.ResendDeliveries(order.supplier_job) end)
+        return
     end
 
-    -- `final` może przyjść jako true/1/'true', a gdy go nie ma – domykamy, jeśli wszystko już oddane
-    if final == nil then final = (left == 0) else final = (final == true or final == 1 or final == 'true' or final == '1') end
+    local names, attempted = {}, {}
+    local function rollbackVehicles()
+        for i = #attempted, 1, -1 do
+            local entry = attempted[i]
+            local ok, err = pcall(data.RemoveVehicle, order.buyer_job, entry.plate)
+            if not ok or err == false then
+                print(('^1[crp_bossmenu]^7 dostawa %d: nie udało się cofnąć pojazdu %s (%s)'):format(
+                    id, tostring(entry.plate), tostring(err)))
+            end
+        end
+    end
 
-    local orderNo, buyerLabel = 'ord-' .. id, data.JobLabel(order.buyer_job)
+    for _, entry in ipairs(pending) do
+        attempted[#attempted + 1] = entry
+        local ok, err = pcall(function()
+            data.AddVehicle(order.buyer_job, entry.plate, entry.item.model, entry.item.name, entry.item.category)
+            data.GrantVehicle(order.buyer_job, entry.plate, entry.item.model)
+        end)
+        if not ok then
+            rollbackVehicles()
+            print(('^1[crp_bossmenu]^7 dostawa %d: rejestracja pojazdu nie powiodła się (%s)'):format(id, tostring(err)))
+            return
+        end
+        names[#names + 1] = ('%s (%s)'):format(entry.item.name or entry.item.model, entry.plate)
+    end
+
+    if isFinal then
+        local statusCall, statusChanged = pcall(function()
+            return data.SetOrderStatus(id, 'supplier_job', order.supplier_job, 'accepted', 'delivered', nil,
+                order.buyer_job, order.supplier_job)
+        end)
+        if not statusCall or not statusChanged then
+            rollbackVehicles()
+            print(('^3[crp_bossmenu]^7 dostawa %d: status zamówienia zmienił się przed domknięciem; pojazdy cofnięto, wypłaty brak'):format(id))
+            return
+        end
+
+        local fundsCall, fundsAdded = pcall(data.AddFunds, order.supplier_job, order.total)
+        if not fundsCall or not fundsAdded then
+            local reopenCall, reopened = pcall(data.SetOrderStatus, id, 'supplier_job', order.supplier_job,
+                'delivered', 'accepted', nil, order.buyer_job, order.supplier_job)
+            if reopenCall and reopened then
+                rollbackVehicles()
+                print(('^1[crp_bossmenu]^7 dostawa %d: konto firmy dostawcy niedostępne; status cofnięto, pojazdy wycofano'):format(id))
+                Server.NotifyJob(order.supplier_job, ('Zamówienie %s nie zostało rozliczone – sprawdź konto firmy; dostawa wróci do realizacji.'):format(orderNo), 'error')
+                Server.Refresh(order.buyer_job, order.supplier_job)
+                SetTimeout(1000, function() Server.ResendDeliveries(order.supplier_job) end)
+            else
+                for _, entry in ipairs(pending) do handed[entry.index] = entry.plate end
+                print(('^1[crp_bossmenu]^7 dostawa %d: wypłata nieudana i nie udało się cofnąć statusu; pojazdy pozostawiono, wymagana ręczna kontrola'):format(id))
+                Server.NotifyJob(order.supplier_job, ('Zamówienie %s wymaga ręcznego rozliczenia – sprawdź konto firmy.'):format(orderNo), 'error')
+                Server.Refresh(order.buyer_job, order.supplier_job)
+            end
+            return
+        end
+    end
+
+    for _, entry in ipairs(pending) do handed[entry.index] = entry.plate end
+
     data.Hist(order.supplier_job, by, { type = 'delivery', orderId = orderNo, buyer = buyerLabel,
-        count = granted, items = names, final = final and true or false })
-
-    Server.NotifyJob(order.buyer_job, ('Dostawa %s: odebrano %d %s (%s)'):format(orderNo, granted,
-        plural(granted, 'pojazd', 'pojazdy', 'pojazdów'), table.concat(names, ', ')), 'success')
+        count = #pending, items = names, final = isFinal })
+    Server.NotifyJob(order.buyer_job, ('Dostawa %s: odebrano %d %s (%s)'):format(orderNo, #pending,
+        plural(#pending, 'pojazd', 'pojazdy', 'pojazdów'), table.concat(names, ', ')), 'success')
     Server.Refresh(order.buyer_job, order.supplier_job)
 
-    if not final then return end
+    if not isFinal then return end
 
-    -- ostatnia partia: płacimy firmie dostawcy i zamykamy zamówienie
-    if not data.SetOrderStatus(id, 'supplier_job', order.supplier_job, 'accepted', 'delivered', nil, order.buyer_job, order.supplier_job) then
-        print(('^3[crp_bossmenu]^7 dostawa %d: nie udało się zamknąć zamówienia (status się zmienił?)^7'):format(id))
-    end
-
-    data.AddFunds(order.supplier_job, order.total)
     data.Tx(order.supplier_job, 'in', order.total, by, 'Dostawa zamówienia',
         ('%s · %s (dostawa lawetą)'):format(orderNo, buyerLabel))
     Server.NotifyJob(order.supplier_job, ('Zamówienie %s dostarczone – środki trafiły na konto firmy.'):format(orderNo), 'success')
@@ -1392,10 +1439,19 @@ RegisterNetEvent('crp_bossmenu:server:deliveryDone', function(orderId, plates, f
     Physical[id] = nil
     data.SetOrderDelivery(id, nil, order.buyer_job, order.supplier_job)
     Server.Refresh(order.buyer_job, order.supplier_job)
+end
+
+AddEventHandler('crp_bossmenu:server:deliveryDone', function(orderId, plates, final, byName)
+    local id = tonumber(tostring(orderId or ''):match('(%d+)$') or '')
+    if not id or deliveryDoneLocks[id] then return end
+    deliveryDoneLocks[id] = true
+    local ok, err = pcall(handleDeliveryDone, orderId, plates, final, byName)
+    deliveryDoneLocks[id] = nil
+    if not ok then print(('^1[crp_bossmenu] deliveryDone:^7 %s'):format(tostring(err))) end
 end)
 
 -- zasób dostawy pyta o zadania (np. po swoim restarcie albo komendą „weź zadanie”)
-RegisterNetEvent('crp_bossmenu:server:deliveryResend', function(supplierJob, cb)
+AddEventHandler('crp_bossmenu:server:deliveryResend', function(supplierJob, cb)
     local src = playerSrc(source)
 
     -- obsługa różnych sposobów wołania (inne zasoby wołają nas jak chcą):

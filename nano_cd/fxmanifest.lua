@@ -18,11 +18,20 @@ version '0.2.0'
 
 lua54 'yes'
 
-shared_script 'config.lua'
-server_script 'server.lua'
+shared_scripts {
+    '@ox_lib/init.lua',
+    'config.lua'
+}
+
+server_scripts {
+    '@oxmysql/lib/MySQL.lua',
+    'server.lua'
+}
+
 client_script 'client.lua'
 
 dependencies {
     'oxmysql',        -- zapis trwały zadań (tabela crp_cd_jobs tworzy się sama)
-    -- 'es_extended',  -- używamy tylko do powiadomień/uprawnień pracownika CD (opcjonalnie)
+    'es_extended',    -- wymagane do weryfikacji firmy po stronie serwera
+    'ox_lib'          -- wymagane przez init.lua; target pozostaje opcjonalny
 }

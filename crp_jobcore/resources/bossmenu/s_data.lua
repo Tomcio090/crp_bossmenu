@@ -1164,6 +1164,10 @@ function data.Funds(job)
     return a and math.floor(a.money) or 0
 end
 
+function data.HasSociety(job)
+    return society(job) ~= nil
+end
+
 function data.RemoveFunds(job, amount)
     local a = society(job)
     if not a or a.money < amount then return false end
@@ -1454,6 +1458,23 @@ local ov = { cols = nil, modelStyle = nil }    -- cache: struktura tabeli + form
 local function ovTable()
     local cfg = vehicleCfg()
     return (cfg and cfg.table) or 'owned_vehicles'
+end
+
+-- Używane wyłącznie do kompensacji nieudanej finalizacji dostawy fizycznej.
+function data.RemoveVehicle(job, plate)
+    local cfg = vehicleCfg()
+    if cfg.enabled then
+        MySQL.update.await(('DELETE FROM `%s` WHERE plate = ?'):format(ovTable()), { plate })
+    end
+    MySQL.update.await('DELETE FROM ' .. T('vehicles') .. ' WHERE plate = ? AND job = ?', { plate, job })
+
+    local c = cache[job]
+    if c and c.vehiclesLoaded then
+        for i = #c.vehicles, 1, -1 do
+            if c.vehicles[i].plate == plate then table.remove(c.vehicles, i) end
+        end
+    end
+    return true
 end
 
 local function ovPick(cols, list)

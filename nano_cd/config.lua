@@ -231,7 +231,7 @@ Config.Handover = {
 
     -- Zapas na weryfikację po stronie serwera: maksymalna odległość gracza od miejsca
     -- odbioru, przy której serwer przyjmie zgłoszenie „oddane” (w metrach).
-    maxServerDistance = 90.0,
+    maxServerDistance = 35.0,
 }
 
 -- ── ZACHOWANIE SKRYPTU ────────────────────────────────────────────────────────
